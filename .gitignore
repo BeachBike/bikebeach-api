@@ -1,5 +1,10 @@
 node_modules
-# Keep environment variables out of version control
+
+# Build artifacts — Railway runs `npm run build` on every deploy.
+dist
+
+# Local env — keep .env.example in version control as documentation.
 .env
+.env.local
 
 /generated/prisma

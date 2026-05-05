@@ -54,6 +54,13 @@ class EnvVars {
   @IsInt()
   @IsOptional()
   PORT: number = 3000;
+
+  /// Comma-separated origin allowlist for CORS. Each entry can be a literal
+  /// origin or a glob (`*` becomes regex). Unset / "*" = allow any. See
+  /// main.ts for the precise parsing.
+  @IsString()
+  @IsOptional()
+  CORS_ORIGINS?: string;
 }
 
 export function validateEnv(config: Record<string, unknown>): EnvVars {
