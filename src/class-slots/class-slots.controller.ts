@@ -58,6 +58,12 @@ export class ClassSlotsController {
     return this.slots.findOne(id);
   }
 
+  @Public()
+  @Get(':id/seat-map')
+  seatMap(@Param('id') id: string) {
+    return this.slots.seatMap(id);
+  }
+
   @Roles(Role.ADMIN, Role.INSTRUCTOR)
   @Patch(':id')
   update(

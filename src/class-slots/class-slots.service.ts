@@ -142,10 +142,56 @@ export class ClassSlotsService {
   async findOne(id: string) {
     const slot = await this.prisma.classSlot.findUnique({
       where: { id },
-      include: { classKind: true },
+      include: {
+        classKind: true,
+        instructor: { select: { id: true, name: true } },
+      },
     });
     if (!slot) throw new NotFoundException('Aula não encontrada');
     return slot;
+  }
+
+  /// Single-call payload for the seat-map UI: slot + all operational bikes
+  /// at the unit + which bike IDs are currently occupied. Public so the
+  /// page can render without forcing a login first; per-user info (mine /
+  /// usual) is computed client-side from /reservations/me.
+  async seatMap(id: string) {
+    const slot = await this.prisma.classSlot.findUnique({
+      where: { id },
+      include: {
+        classKind: true,
+        instructor: { select: { id: true, name: true } },
+      },
+    });
+    if (!slot) throw new NotFoundException('Aula não encontrada');
+
+    const bikes = await this.prisma.bike.findMany({
+      where: { unitId: slot.unitId, status: 'OPERATIONAL' },
+      orderBy: { label: 'asc' },
+      select: {
+        id: true,
+        label: true,
+        positionX: true,
+        positionY: true,
+        status: true,
+      },
+    });
+
+    const reservations = await this.prisma.reservation.findMany({
+      where: {
+        classSlotId: id,
+        status: { in: ['ACTIVE', 'CHECKED_IN'] },
+      },
+      select: { bikeId: true },
+    });
+    const occupiedBikeIds = reservations.map((r) => r.bikeId);
+
+    return {
+      slot,
+      bikes,
+      occupiedBikeIds,
+      freeSpots: Math.max(0, slot.capacity - reservations.length),
+    };
   }
 
   async update(id: string, dto: UpdateClassSlotDto, user: AuthenticatedUser) {

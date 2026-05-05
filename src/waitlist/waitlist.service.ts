@@ -77,9 +77,20 @@ export class WaitlistService {
     }
 
     try {
-      return await this.prisma.waitlistEntry.create({
+      const entry = await this.prisma.waitlistEntry.create({
         data: { classSlotId: slotId, userId: user.id },
       });
+      // Position in the queue (1-indexed) — count of pending entries that
+      // joined at or before this one.
+      const position = await this.prisma.waitlistEntry.count({
+        where: {
+          classSlotId: slotId,
+          promotedAt: null,
+          removedAt: null,
+          joinedAt: { lte: entry.joinedAt },
+        },
+      });
+      return { ...entry, position };
     } catch (err) {
       if (
         err instanceof Prisma.PrismaClientKnownRequestError &&

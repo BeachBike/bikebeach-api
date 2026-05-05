@@ -18,9 +18,15 @@ interface GateField {
   valid: boolean;
 }
 
+interface ParqField extends GateField {
+  /// Last submitted answer object — frontend uses this to pre-fill the form
+  /// so the user only edits what changed (per CLAUDE.md product rule).
+  latestAnswers: Record<string, unknown> | null;
+}
+
 export interface HealthGateStatus {
   liability: GateField;
-  parq: GateField;
+  parq: ParqField;
   ok: boolean;
 }
 
@@ -47,12 +53,17 @@ export class HealthGateService {
       LIABILITY_VALIDITY_DAYS,
       now,
     );
-    const parq = this.computeField(
+    const parqBase = this.computeField(
       latestParq?.version ?? null,
       latestParq?.acceptedAt ?? null,
       PARQ_VALIDITY_DAYS,
       now,
     );
+    const parq: ParqField = {
+      ...parqBase,
+      latestAnswers:
+        (latestParq?.answers as Record<string, unknown> | null) ?? null,
+    };
 
     return { liability, parq, ok: liability.valid && parq.valid };
   }
