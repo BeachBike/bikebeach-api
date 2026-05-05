@@ -1,0 +1,563 @@
+// Prisma schema. See https://pris.ly/d/prisma-schema for syntax reference.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =============================================================================
+// Enums
+// =============================================================================
+
+enum Role {
+  USER
+  INSTRUCTOR
+  ADMIN
+}
+
+enum ClassSlotStatus {
+  SCHEDULED
+  CANCELLED_BEFORE
+  CANCELLED_DURING
+  COMPLETED
+}
+
+/// Reasons the INSTRUCTOR cancels in advance because they personally can't
+/// make the class. Used together with `cancellationKind = PERSONAL`.
+enum PersonalCancellationReason {
+  SAUDE
+  PESSOAL
+  CLIMA
+  OUTRO
+}
+
+/// Reasons the studio cancels the class itself (typically the live cancel
+/// during a session, but also bulk pre-cancels). Used together with
+/// `cancellationKind = STUDIO`.
+enum StudioCancellationReason {
+  CHUVA
+  VENTO
+  RAIO
+  TECNICO
+  MAR_ALTO
+  MANUTENCAO
+  SEGURANCA
+  BAIXA_ADESAO
+  OUTRO
+}
+
+enum CancellationKind {
+  PERSONAL
+  STUDIO
+}
+
+enum ReservationStatus {
+  ACTIVE
+  CHECKED_IN
+  COMPLETED
+  NO_SHOW
+  CANCELLED_BY_USER
+  CANCELLED_BY_STUDIO
+}
+
+enum CreditSource {
+  PURCHASE_PACK
+  SUBSCRIPTION_CYCLE
+  ADMIN_GRANT
+  REFUND
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  PAUSED
+  CANCELLED
+  PAST_DUE
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+}
+
+enum PaymentMethod {
+  PIX
+  CREDIT_CARD
+  DEBIT_CARD
+}
+
+enum PaymentKind {
+  ONE_OFF_PACK
+  SUBSCRIPTION_CYCLE
+}
+
+enum BikeStatus {
+  OPERATIONAL
+  MAINTENANCE
+  OUT_OF_SERVICE
+}
+
+/// Profile field: what the user is training for. Drives default class
+/// suggestions and analytics. Optional at signup.
+enum UserGoal {
+  PERDER_PESO
+  GANHAR_CONDICIONAMENTO
+  MANTER_FORMA
+  COMPETIR
+  OUTRO
+}
+
+/// Self-reported fitness level. Optional at signup.
+enum FitnessLevel {
+  INICIANTE
+  INTERMEDIARIO
+  AVANCADO
+}
+
+// =============================================================================
+// Tenancy
+// =============================================================================
+
+/// A physical location where classes happen (a stretch of beach).
+model Unit {
+  id                          String   @id @default(cuid())
+  name                        String
+  slug                        String   @unique
+  address                     String
+  isActive                    Boolean  @default(true)
+  /// Minutes after class start that a user can still check in. Default 5.
+  lateCheckinToleranceMinutes Int      @default(5)
+  /// Discount applied when paying via PIX (whole percent — 5 = 5%). Configurable
+  /// per unit in case different markets get different deals.
+  pixDiscountPercent          Int      @default(5)
+  createdAt                   DateTime @default(now())
+  updatedAt                   DateTime @updatedAt
+
+  staff      User[]
+  bikes      Bike[]
+  classSlots ClassSlot[]
+  packOffers PackOffer[]
+}
+
+// =============================================================================
+// Identity
+// =============================================================================
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  name         String
+  phone        String?
+  /// Brazilian CPF — required by Asaas to create a customer. Captured at
+  /// signup or via PATCH; can be null for staff who never purchase.
+  cpf          String?
+  /// Lazily set the first time the user makes a purchase. 1:1 with our User.
+  asaasCustomerId String? @unique
+  role         Role     @default(USER)
+  /// Set for INSTRUCTOR (mandatory) and optionally for ADMIN scoped to a unit.
+  /// Regular USERs are global — they may book at any active unit.
+  unitId       String?
+  unit         Unit?    @relation(fields: [unitId], references: [id])
+  isActive     Boolean  @default(true)
+  /// Profile fields collected at signup (optional).
+  birthDate    DateTime?
+  goal         UserGoal?
+  fitnessLevel FitnessLevel?
+  /// True when the user must change their password before doing anything else
+  /// (e.g. staff created by admin with a temporary password). Cleared on
+  /// first successful password change.
+  mustChangePassword Boolean @default(false)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  refreshTokens        RefreshToken[]
+  passwordResetTokens  PasswordResetToken[]
+  liabilityAcceptances LiabilityAcceptance[]
+  parqResponses        ParqResponse[]
+  instructedClassSlots ClassSlot[]           @relation("InstructedSlots")
+  cancelledClassSlots  ClassSlot[]           @relation("CancelledByUserSlots")
+  reservations         Reservation[]
+  cancelledReservations Reservation[]        @relation("ReservationCancelledBy")
+  waitlistEntries      WaitlistEntry[]
+  creditPacks          CreditPack[]
+  subscriptions        Subscription[]
+  payments             Payment[]
+  loggedBikeMaintenance BikeMaintenance[]    @relation("BikeMaintenanceLogger")
+
+  @@index([unitId])
+}
+
+/// One row per issued refresh token. Hashed (sha256) — never stored in plain.
+/// Rotation: on /refresh we revoke the used token and link the new one via
+/// `replacedByTokenId`. If a revoked token is presented again it counts as
+/// reuse and we revoke every active token of that user.
+model RefreshToken {
+  id                String    @id @default(cuid())
+  userId            String
+  user              User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash         String    @unique
+  expiresAt         DateTime
+  revokedAt         DateTime?
+  replacedByTokenId String?   @unique
+  createdByIp       String?
+  userAgent         String?
+  createdAt         DateTime  @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+/// One row per password-reset request. Token sent to e-mail, stored as sha256.
+/// Single-use: once consumed (`usedAt` set) it can't be presented again.
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// =============================================================================
+// Health gate (LGPD-sensitive)
+// =============================================================================
+
+/// Each row = one acceptance event. Latest row drives validity (monthly window).
+model LiabilityAcceptance {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// Document version the user accepted (e.g. "v1.0"). Bumping the version
+  /// effectively forces a new acceptance from everyone on next reservation.
+  version    String
+  ipAddress  String?
+  userAgent  String?
+  acceptedAt DateTime @default(now())
+
+  @@index([userId, acceptedAt(sort: Desc)])
+}
+
+/// Each row = one PAR-Q submission. Latest row drives validity (quarterly window).
+model ParqResponse {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  version    String
+  /// Free-form JSON of question→answer pairs, validated by the controller.
+  answers    Json
+  ipAddress  String?
+  userAgent  String?
+  acceptedAt DateTime @default(now())
+
+  @@index([userId, acceptedAt(sort: Desc)])
+}
+
+// =============================================================================
+// Domain — bikes, classes, reservations, waitlist
+// =============================================================================
+
+/// A physical bike at a Unit. Reusable across many class slots — a Reservation
+/// is what couples a (slot, bike) for a specific user at a specific time.
+model Bike {
+  id        String     @id @default(cuid())
+  unitId    String
+  unit      Unit       @relation(fields: [unitId], references: [id])
+  /// Studio-facing label, e.g. "Bike 01" or "A1". Unique within a unit.
+  label     String
+  /// Optional grid coordinates for the seat-map UI. Frontend interprets.
+  positionX Int?
+  positionY Int?
+  /// Operational state. Only OPERATIONAL bikes are bookable. RESERVED is NOT
+  /// stored — it's derived at runtime from active reservations on the slot.
+  status    BikeStatus @default(OPERATIONAL)
+  /// Free-text for instructor reference (maintenance notes, special equipment).
+  notes     String?
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  reservations    Reservation[]
+  maintenanceLogs BikeMaintenance[]
+
+  @@unique([unitId, label])
+  @@index([unitId, status])
+}
+
+/// Service-history entry per bike. Schema-only for now — no service/controller
+/// in v1 (admin UI defers to v2). Lets us start logging revisions when the
+/// portal is ready without another migration.
+model BikeMaintenance {
+  id          String   @id @default(cuid())
+  bikeId      String
+  bike        Bike     @relation(fields: [bikeId], references: [id], onDelete: Cascade)
+  loggedById  String
+  loggedBy    User     @relation("BikeMaintenanceLogger", fields: [loggedById], references: [id])
+  description String
+  performedAt DateTime @default(now())
+  createdAt   DateTime @default(now())
+
+  @@index([bikeId, performedAt(sort: Desc)])
+}
+
+/// Pre-defined kinds of class (sunrise / sunset / power / beat-drill / almoço /
+/// noturno). Seeded with a starter set; admin can add/disable. ClassSlot.kindId
+/// is optional — legacy/free-text slots are still allowed.
+model ClassKind {
+  id                     String   @id @default(cuid())
+  /// Stable machine slug (e.g. "sunrise"). Unique.
+  slug                   String   @unique
+  /// Display name in pt-BR.
+  name                   String
+  /// Default duration when the instructor picks this kind. They can override.
+  defaultDurationMinutes Int
+  /// 1 (chill) → 5 (extreme). UI hint only.
+  intensity              Int      @default(3)
+  /// Free-text vibe descriptor for the UI (e.g. "Despertar enérgico").
+  tone                   String?
+  isActive               Boolean  @default(true)
+  /// UI ordering (smaller first).
+  displayOrder           Int      @default(0)
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+
+  classSlots ClassSlot[]
+}
+
+/// Per-unit pricing offer for one-off credit packs. Replaces the old
+/// PACK_PRICING_CENTS constant — admin can tune from the dashboard.
+model PackOffer {
+  id              String   @id @default(cuid())
+  unitId          String
+  unit            Unit     @relation(fields: [unitId], references: [id])
+  /// Number of credits in this pack (1 = avulso, 10 / 20 = packs).
+  classes         Int
+  priceCents      Int
+  /// Days after purchase that the resulting CreditPack expires.
+  expirationDays  Int
+  isActive        Boolean  @default(true)
+  /// Smaller first in UI.
+  displayOrder    Int      @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  /// Only one active offer per (unit, classes) — admin "edits" by patching the
+  /// row, not by creating a duplicate.
+  @@unique([unitId, classes])
+  @@index([unitId, isActive])
+}
+
+/// A scheduled class — one instructor, a starts-at, a duration, a capacity.
+/// All of the unit's active bikes are bookable for this slot unless we add
+/// per-slot exclusions later.
+model ClassSlot {
+  id              String   @id @default(cuid())
+  unitId          String
+  unit            Unit     @relation(fields: [unitId], references: [id])
+  instructorId    String
+  instructor      User     @relation("InstructedSlots", fields: [instructorId], references: [id])
+  /// Optional preset kind (sunrise/sunset/etc). When set, frontend uses its
+  /// name + tone + intensity for display. When null, falls back to `title`.
+  classKindId     String?
+  classKind       ClassKind? @relation(fields: [classKindId], references: [id])
+  title           String?
+  startsAt        DateTime
+  durationMinutes Int
+  /// Maximum number of concurrent reservations. Typically equal to or less than
+  /// the unit's active-bike count. Set by admin/instructor on creation.
+  capacity        Int
+
+  status                     ClassSlotStatus              @default(SCHEDULED)
+  /// Discriminator for which reason column applies. Service enforces that
+  /// exactly one of personal/studio reason is non-null when this is set.
+  cancellationKind           CancellationKind?
+  personalCancellationReason PersonalCancellationReason?
+  studioCancellationReason   StudioCancellationReason?
+  cancellationDescription    String?
+  cancelledByUserId          String?
+  cancelledBy                User?                        @relation("CancelledByUserSlots", fields: [cancelledByUserId], references: [id])
+  cancelledAt                DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  reservations    Reservation[]
+  waitlistEntries WaitlistEntry[]
+
+  @@index([unitId, startsAt])
+  @@index([instructorId, startsAt])
+  @@index([status, startsAt])
+}
+
+/// A single (user, classSlot, bike) booking. Always sourced from a CreditPack.
+///
+/// Concurrency note — the `activeKey` column enforces "one ACTIVE/CHECKED_IN
+/// reservation per (slot, bike)" via Postgres' "NULL is distinct in UNIQUE"
+/// behaviour:
+///   - On create:   `activeKey = "${classSlotId}:${bikeId}"`
+///   - On cancel/no-show/complete: set to NULL (multiple NULLs allowed)
+/// This avoids needing a partial-index migration while still preventing
+/// double-booking of a bike for the same slot. The status enum remains the
+/// source of truth for state; activeKey is a derived constraint helper.
+model Reservation {
+  id           String     @id @default(cuid())
+  classSlotId  String
+  classSlot    ClassSlot  @relation(fields: [classSlotId], references: [id])
+  bikeId       String
+  bike         Bike       @relation(fields: [bikeId], references: [id])
+  userId       String
+  user         User       @relation(fields: [userId], references: [id])
+  creditPackId String
+  creditPack   CreditPack @relation(fields: [creditPackId], references: [id])
+
+  promotedFromWaitlist Boolean @default(false)
+
+  status            ReservationStatus @default(ACTIVE)
+  /// See model-level note. Set by service layer.
+  activeKey         String?           @unique
+  checkedInAt       DateTime?
+  cancelledAt       DateTime?
+  cancelledByUserId String?
+  cancelledBy       User?             @relation("ReservationCancelledBy", fields: [cancelledByUserId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([classSlotId])
+  @@index([userId])
+  @@index([bikeId])
+  @@index([creditPackId])
+}
+
+/// FIFO queue per ClassSlot. When a reservation is cancelled, the next entry
+/// is auto-promoted (a new Reservation is created and a credit is consumed).
+model WaitlistEntry {
+  id          String    @id @default(cuid())
+  classSlotId String
+  classSlot   ClassSlot @relation(fields: [classSlotId], references: [id])
+  userId      String
+  user        User      @relation(fields: [userId], references: [id])
+  joinedAt    DateTime  @default(now())
+  promotedAt  DateTime?
+  removedAt   DateTime?
+
+  /// One waitlist entry per user per slot. Cancelling a queued entry deletes
+  /// the row (or sets removedAt — TBD when we wire 5b).
+  @@unique([classSlotId, userId])
+  @@index([classSlotId, joinedAt])
+}
+
+// =============================================================================
+// Credits, plans, subscriptions, payments
+// =============================================================================
+
+/// A bucket of class credits. Sources: bought as a one-off pack, granted by a
+/// subscription cycle, granted by admin, or refunded from a cancelled reservation.
+/// Reservation always consumes 1 credit from one CreditPack.
+model CreditPack {
+  id               String       @id @default(cuid())
+  userId           String
+  user             User         @relation(fields: [userId], references: [id])
+  source           CreditSource
+  totalCredits     Int
+  remainingCredits Int
+  /// NULL means never expires (rare — admin grants only, typically).
+  expiresAt        DateTime?
+
+  /// If sourced from a Subscription cycle, link back for traceability.
+  subscriptionId String?
+  subscription   Subscription? @relation(fields: [subscriptionId], references: [id])
+
+  /// If sourced from a one-off Payment, link back. Subscription cycles also
+  /// have an associated Payment; that link is reflected on Payment.creditPackId.
+  paymentId String?
+  payment   Payment? @relation(fields: [paymentId], references: [id])
+
+  reservations Reservation[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// "Pack with credits left, not expired" lookup is the hot path during reservation.
+  @@index([userId, expiresAt])
+  @@index([userId, remainingCredits])
+}
+
+/// A purchasable monthly plan (e.g. "Plano 8 aulas — R$ 199/mês").
+model Plan {
+  id            String   @id @default(cuid())
+  name          String
+  monthlyCredits Int
+  priceCents    Int
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  subscriptions Subscription[]
+}
+
+/// One subscription per user-cycle. Cancelled subs stay for history.
+model Subscription {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id])
+  planId String
+  plan   Plan   @relation(fields: [planId], references: [id])
+
+  /// Asaas subscription id. Optional during creation, set after Asaas confirms.
+  asaasSubscriptionId String?            @unique
+  status              SubscriptionStatus @default(ACTIVE)
+  currentPeriodStart  DateTime
+  currentPeriodEnd    DateTime
+  cancelledAt         DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  creditPacks CreditPack[]
+  payments    Payment[]
+
+  @@index([userId, status])
+}
+
+/// A monetary transaction — either a one-off pack purchase or a subscription
+/// cycle charge. Asaas is the source of truth; this row mirrors it for our use.
+model Payment {
+  id             String        @id @default(cuid())
+  userId         String
+  user           User          @relation(fields: [userId], references: [id])
+  asaasChargeId  String        @unique
+  amountCents    Int
+  method         PaymentMethod
+  status         PaymentStatus @default(PENDING)
+  kind           PaymentKind
+  paidAt         DateTime?
+
+  /// Set when kind = SUBSCRIPTION_CYCLE.
+  subscriptionId String?
+  subscription   Subscription? @relation(fields: [subscriptionId], references: [id])
+
+  /// Set when kind = ONE_OFF_PACK. Snapshots the pack at purchase time so the
+  /// webhook can mint the correct CreditPack regardless of the admin later
+  /// editing or removing the offer.
+  packCredits         Int?
+  packExpirationDays  Int?
+
+  /// The CreditPack created from this Payment (when applicable). Backref of
+  /// CreditPack.payment.
+  creditPacks CreditPack[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([status])
+}
