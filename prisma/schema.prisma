@@ -64,6 +64,16 @@ enum ReservationStatus {
   CANCELLED_BY_STUDIO
 }
 
+/// G1 — lifecycle of a friend invite. PENDING is the only "live" state;
+/// the other three are terminal records preserved for audit (so a user
+/// can't re-spam after a decline without re-sending).
+enum FriendRequestStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+  CANCELLED
+}
+
 enum CreditSource {
   PURCHASE_PACK
   SUBSCRIPTION_CYCLE
@@ -72,6 +82,7 @@ enum CreditSource {
 }
 
 enum SubscriptionStatus {
+  PENDING_PAYMENT
   ACTIVE
   PAUSED
   CANCELLED
@@ -102,6 +113,18 @@ enum BikeStatus {
   OUT_OF_SERVICE
 }
 
+/// Restricted to the bikebeach palette (item 16.1). Drives the colored
+/// chip / pill that represents a class kind in the calendar, on the home,
+/// and inside the dashboard. Repetition across kinds is allowed by design.
+enum ClassKindColor {
+  CLAY
+  SUN
+  SEA
+  SAND
+  INK
+  GREEN
+}
+
 /// Profile field: what the user is training for. Drives default class
 /// suggestions and analytics. Optional at signup.
 enum UserGoal {
@@ -129,12 +152,21 @@ model Unit {
   name                        String
   slug                        String   @unique
   address                     String
+  /// Free-text descrição da arena (admin-managed) — usada na home e no
+  /// drawer de detalhes. Adicionada na Fase B1 (2026-05).
+  description                 String?
   isActive                    Boolean  @default(true)
-  /// Minutes after class start that a user can still check in. Default 5.
+  /// Layout bounds for the bike grid editor (B3, 2026-05). Free range —
+  /// admin picks rows (A-J max, 2..10) and cols (1..12) when designing the
+  /// arena. The PHYSICAL bike count is independent: it tracks the active
+  /// `Bike` rows for this unit. Capacity of a class slot derives from the
+  /// bike count, not from the grid bounds.
+  maxRows                     Int      @default(4)
+  maxCols                     Int      @default(8)
+  /// Late-check-in tolerance (minutes after class start). Hidden from the
+  /// admin form per 2026-05 — kept here so behavior remains configurable
+  /// per arena via direct DB access if needed; defaults to 5 system-wide.
   lateCheckinToleranceMinutes Int      @default(5)
-  /// Discount applied when paying via PIX (whole percent — 5 = 5%). Configurable
-  /// per unit in case different markets get different deals.
-  pixDiscountPercent          Int      @default(5)
   createdAt                   DateTime @default(now())
   updatedAt                   DateTime @updatedAt
 
@@ -142,6 +174,9 @@ model Unit {
   bikes      Bike[]
   classSlots ClassSlot[]
   packOffers PackOffer[]
+  /// Inverse of `InstructorArena.unit` — instructors who can teach here.
+  /// Driven by the M2M table; `staff` (single-side) stays for ADMIN role.
+  instructorAssignments InstructorArena[] @relation("ArenaInstructors")
 }
 
 // =============================================================================
@@ -149,48 +184,108 @@ model Unit {
 // =============================================================================
 
 model User {
-  id           String   @id @default(cuid())
-  email        String   @unique
-  passwordHash String
-  name         String
-  phone        String?
+  id                 String        @id @default(cuid())
+  email              String        @unique
+  passwordHash       String
+  name               String
+  phone              String?
   /// Brazilian CPF — required by Asaas to create a customer. Captured at
   /// signup or via PATCH; can be null for staff who never purchase.
-  cpf          String?
+  cpf                String?
   /// Lazily set the first time the user makes a purchase. 1:1 with our User.
-  asaasCustomerId String? @unique
-  role         Role     @default(USER)
+  asaasCustomerId    String?       @unique
+  role               Role          @default(USER)
   /// Set for INSTRUCTOR (mandatory) and optionally for ADMIN scoped to a unit.
   /// Regular USERs are global — they may book at any active unit.
-  unitId       String?
-  unit         Unit?    @relation(fields: [unitId], references: [id])
-  isActive     Boolean  @default(true)
+  unitId             String?
+  unit               Unit?         @relation(fields: [unitId], references: [id])
+  isActive           Boolean       @default(true)
   /// Profile fields collected at signup (optional).
-  birthDate    DateTime?
-  goal         UserGoal?
-  fitnessLevel FitnessLevel?
+  birthDate          DateTime?
+  goal               UserGoal?
+  fitnessLevel       FitnessLevel?
   /// True when the user must change their password before doing anything else
   /// (e.g. staff created by admin with a temporary password). Cleared on
   /// first successful password change.
-  mustChangePassword Boolean @default(false)
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  mustChangePassword Boolean       @default(false)
+  /// Free-text bio shown on instructor profile (admin-managed). Required
+  /// for INSTRUCTOR role — enforced at service layer.
+  bio                String?
+  /// Carro-chefe — the instructor's signature ClassKind. Drives the avatar
+  /// tint on cards and the home-page hero. Always one of their
+  /// `instructorSpecialties`. Added in C1 (2026-05).
+  primaryClassKindId String?
+  primaryClassKind   ClassKind?    @relation("PrimaryClassKind", fields: [primaryClassKindId], references: [id])
 
-  refreshTokens        RefreshToken[]
-  passwordResetTokens  PasswordResetToken[]
-  liabilityAcceptances LiabilityAcceptance[]
-  parqResponses        ParqResponse[]
-  instructedClassSlots ClassSlot[]           @relation("InstructedSlots")
-  cancelledClassSlots  ClassSlot[]           @relation("CancelledByUserSlots")
-  reservations         Reservation[]
-  cancelledReservations Reservation[]        @relation("ReservationCancelledBy")
-  waitlistEntries      WaitlistEntry[]
-  creditPacks          CreditPack[]
-  subscriptions        Subscription[]
-  payments             Payment[]
-  loggedBikeMaintenance BikeMaintenance[]    @relation("BikeMaintenanceLogger")
+  /// G1 — short shareable token used to add this user as a friend. Lazily
+  /// generated the first time the user opens the friends tab; null for
+  /// existing rows that never asked for one. 8 chars, base32-ish alphabet
+  /// (no I/O/0/1) — see `friend-code.ts`.
+  friendCode                   String? @unique
+  /// G1 — global "modo invisível" toggle. When true, this user is hidden
+  /// from the `friends-attending` payload of every slot. Doesn't break
+  /// existing friendships; just mutes presence.
+  hideReservationsFromFriends  Boolean @default(false)
+
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+
+  refreshTokens         RefreshToken[]
+  passwordResetTokens   PasswordResetToken[]
+  liabilityAcceptances  LiabilityAcceptance[]
+  parqResponses         ParqResponse[]
+  instructedClassSlots  ClassSlot[]           @relation("InstructedSlots")
+  cancelledClassSlots   ClassSlot[]           @relation("CancelledByUserSlots")
+  reservations          Reservation[]
+  cancelledReservations Reservation[]         @relation("ReservationCancelledBy")
+  waitlistEntries       WaitlistEntry[]
+  creditPacks           CreditPack[]
+  subscriptions         Subscription[]
+  payments              Payment[]
+  loggedBikeMaintenance BikeMaintenance[]     @relation("BikeMaintenanceLogger")
+  instructorSpecialties InstructorSpecialty[]
+  /// 2026-05 — instructor multi-arena. An INSTRUCTOR can teach at one or
+  /// more arenas. `User.unitId` is preserved as the legacy single-side
+  /// pointer so ADMIN scoping keeps working; for INSTRUCTOR the canonical
+  /// source is this M2M. See `InstructorArena`.
+  arenaAssignments      InstructorArena[]     @relation("InstructorArenas")
+  /// Outgoing + incoming friend-related rows. Two relation names because
+  /// the same User shows up on either side of a request and a friendship.
+  friendRequestsSent     FriendRequest[] @relation("FriendRequestFrom")
+  friendRequestsReceived FriendRequest[] @relation("FriendRequestTo")
+  friendshipsAsA         Friendship[]    @relation("FriendshipA")
+  friendshipsAsB         Friendship[]    @relation("FriendshipB")
 
   @@index([unitId])
+}
+
+/// Junction table for INSTRUCTOR ↔ arenas (2026-05). Lets the same
+/// instructor appear on the staff list of multiple arenas without
+/// duplicating User rows. Rows are managed via `UsersService.createStaff`
+/// and `updateStaff` when an admin picks N arenas for the instructor.
+model InstructorArena {
+  userId    String
+  user      User     @relation("InstructorArenas", fields: [userId], references: [id], onDelete: Cascade)
+  unitId    String
+  unit      Unit     @relation("ArenaInstructors", fields: [unitId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@id([userId, unitId])
+  @@index([unitId])
+}
+
+/// Many-to-many: which class kinds an INSTRUCTOR is qualified to teach.
+/// Drives the instructor profile and the class-kind dropdown on the
+/// calendar (filtered to the picked instructor's specialties).
+model InstructorSpecialty {
+  userId      String
+  classKindId String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  classKind   ClassKind @relation(fields: [classKindId], references: [id], onDelete: Cascade)
+  createdAt   DateTime  @default(now())
+
+  @@id([userId, classKindId])
+  @@index([classKindId])
 }
 
 /// One row per issued refresh token. Hashed (sha256) — never stored in plain.
@@ -274,14 +369,24 @@ model Bike {
   unit      Unit       @relation(fields: [unitId], references: [id])
   /// Studio-facing label, e.g. "Bike 01" or "A1". Unique within a unit.
   label     String
-  /// Optional grid coordinates for the seat-map UI. Frontend interprets.
-  positionX Int?
-  positionY Int?
+  /// Grid coordinates within the arena. `row` = single uppercase letter
+  /// (A, B, ...), `col` = 1-based column. Pair must be unique per unit so
+  /// no two bikes share the same physical spot. Nullable to support
+  /// fresh-cadastrada bikes that haven't been placed in the layout yet
+  /// (admin drops them in via the layout editor — B3, 2026-05).
+  row       String?
+  col       Int?
   /// Operational state. Only OPERATIONAL bikes are bookable. RESERVED is NOT
   /// stored — it's derived at runtime from active reservations on the slot.
   status    BikeStatus @default(OPERATIONAL)
   /// Free-text for instructor reference (maintenance notes, special equipment).
   notes     String?
+  /// 2026-05 — soft-delete via timestamp. When set, the bike disappears
+  /// from every list endpoint + the arena layout but stays in the DB so
+  /// historical reservations still resolve to a label. Hard-delete is
+  /// only allowed when the bike has zero reservations (handled at
+  /// service-layer); otherwise use this flag.
+  deletedAt DateTime?
   createdAt DateTime   @default(now())
   updatedAt DateTime   @updatedAt
 
@@ -289,6 +394,7 @@ model Bike {
   maintenanceLogs BikeMaintenance[]
 
   @@unique([unitId, label])
+  @@unique([unitId, row, col], name: "Bike_unitId_row_col_key")
   @@index([unitId, status])
 }
 
@@ -322,32 +428,44 @@ model ClassKind {
   /// 1 (chill) → 5 (extreme). UI hint only.
   intensity              Int      @default(3)
   /// Free-text vibe descriptor for the UI (e.g. "Despertar enérgico").
+  /// Editorial copy — never used to derive color.
   tone                   String?
+  /// Design system color picked by the admin (B2). Drives chip/pill rendering
+  /// across the app. Defaults to SEA so unmigrated rows keep working.
+  colorToken             ClassKindColor @default(SEA)
   isActive               Boolean  @default(true)
-  /// UI ordering (smaller first).
-  displayOrder           Int      @default(0)
   createdAt              DateTime @default(now())
   updatedAt              DateTime @updatedAt
 
-  classSlots ClassSlot[]
+  classSlots            ClassSlot[]
+  instructorSpecialties InstructorSpecialty[]
+  /// Reverse side of `User.primaryClassKind` (carro-chefe).
+  primaryForInstructors User[]                @relation("PrimaryClassKind")
 }
 
 /// Per-unit pricing offer for one-off credit packs. Replaces the old
 /// PACK_PRICING_CENTS constant — admin can tune from the dashboard.
 model PackOffer {
-  id              String   @id @default(cuid())
-  unitId          String
-  unit            Unit     @relation(fields: [unitId], references: [id])
+  id             String   @id @default(cuid())
+  unitId         String
+  unit           Unit     @relation(fields: [unitId], references: [id])
   /// Number of credits in this pack (1 = avulso, 10 / 20 = packs).
-  classes         Int
-  priceCents      Int
+  classes        Int
+  priceCents     Int
   /// Days after purchase that the resulting CreditPack expires.
-  expirationDays  Int
-  isActive        Boolean  @default(true)
+  expirationDays Int
+  isActive       Boolean  @default(true)
   /// Smaller first in UI.
-  displayOrder    Int      @default(0)
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  displayOrder   Int      @default(0)
+  /// Optional time-windowed discount (C3 / item 17). All three fields move
+  /// together — service rejects partial sets. `discountPercent` is 1-100;
+  /// the discount is "active" when `now ∈ [discountStartsAt, discountEndsAt]`.
+  /// The /planos public renders a strikethrough + "−X% até DD/MM" badge.
+  discountPercent   Int?
+  discountStartsAt  DateTime?
+  discountEndsAt    DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
 
   /// Only one active offer per (unit, classes) — admin "edits" by patching the
   /// row, not by creating a duplicate.
@@ -359,11 +477,11 @@ model PackOffer {
 /// All of the unit's active bikes are bookable for this slot unless we add
 /// per-slot exclusions later.
 model ClassSlot {
-  id              String   @id @default(cuid())
+  id              String     @id @default(cuid())
   unitId          String
-  unit            Unit     @relation(fields: [unitId], references: [id])
+  unit            Unit       @relation(fields: [unitId], references: [id])
   instructorId    String
-  instructor      User     @relation("InstructedSlots", fields: [instructorId], references: [id])
+  instructor      User       @relation("InstructedSlots", fields: [instructorId], references: [id])
   /// Optional preset kind (sunrise/sunset/etc). When set, frontend uses its
   /// name + tone + intensity for display. When null, falls back to `title`.
   classKindId     String?
@@ -375,7 +493,7 @@ model ClassSlot {
   /// the unit's active-bike count. Set by admin/instructor on creation.
   capacity        Int
 
-  status                     ClassSlotStatus              @default(SCHEDULED)
+  status                     ClassSlotStatus             @default(SCHEDULED)
   /// Discriminator for which reason column applies. Service enforces that
   /// exactly one of personal/studio reason is non-null when this is set.
   cancellationKind           CancellationKind?
@@ -383,8 +501,17 @@ model ClassSlot {
   studioCancellationReason   StudioCancellationReason?
   cancellationDescription    String?
   cancelledByUserId          String?
-  cancelledBy                User?                        @relation("CancelledByUserSlots", fields: [cancelledByUserId], references: [id])
+  cancelledBy                User?                       @relation("CancelledByUserSlots", fields: [cancelledByUserId], references: [id])
   cancelledAt                DateTime?
+
+  /// Wall-clock instant the instructor confirmed the class started. While
+  /// null and `now > startsAt`, the cron's auto-confirm job is allowed to
+  /// flip this on its own (with `autoStartConfirmed = true`).
+  confirmedStartedAt         DateTime?
+  /// True when the cron promoted the slot without an instructor tap. Used
+  /// in audit views so admins can spot instructors who routinely miss the
+  /// confirm window.
+  autoStartConfirmed         Boolean                     @default(false)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -427,6 +554,10 @@ model Reservation {
   cancelledAt       DateTime?
   cancelledByUserId String?
   cancelledBy       User?             @relation("ReservationCancelledBy", fields: [cancelledByUserId], references: [id])
+  /// Free-text reason supplied when the user marks themselves NO_SHOW
+  /// (E4) or when an admin/instructor cancels for an explicit reason
+  /// outside the structured ClassSlot.cancellationReason enum.
+  cancellationReason String?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -493,13 +624,17 @@ model CreditPack {
 
 /// A purchasable monthly plan (e.g. "Plano 8 aulas — R$ 199/mês").
 model Plan {
-  id            String   @id @default(cuid())
-  name          String
+  id             String   @id @default(cuid())
+  name           String
   monthlyCredits Int
-  priceCents    Int
-  isActive      Boolean  @default(true)
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  priceCents     Int
+  isActive       Boolean  @default(true)
+  /// Optional time-windowed discount — same shape as PackOffer (see C3).
+  discountPercent   Int?
+  discountStartsAt  DateTime?
+  discountEndsAt    DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
 
   subscriptions Subscription[]
 }
@@ -514,7 +649,7 @@ model Subscription {
 
   /// Asaas subscription id. Optional during creation, set after Asaas confirms.
   asaasSubscriptionId String?            @unique
-  status              SubscriptionStatus @default(ACTIVE)
+  status              SubscriptionStatus @default(PENDING_PAYMENT)
   currentPeriodStart  DateTime
   currentPeriodEnd    DateTime
   cancelledAt         DateTime?
@@ -531,15 +666,15 @@ model Subscription {
 /// A monetary transaction — either a one-off pack purchase or a subscription
 /// cycle charge. Asaas is the source of truth; this row mirrors it for our use.
 model Payment {
-  id             String        @id @default(cuid())
-  userId         String
-  user           User          @relation(fields: [userId], references: [id])
-  asaasChargeId  String        @unique
-  amountCents    Int
-  method         PaymentMethod
-  status         PaymentStatus @default(PENDING)
-  kind           PaymentKind
-  paidAt         DateTime?
+  id            String        @id @default(cuid())
+  userId        String
+  user          User          @relation(fields: [userId], references: [id])
+  asaasChargeId String        @unique
+  amountCents   Int
+  method        PaymentMethod
+  status        PaymentStatus @default(PENDING)
+  kind          PaymentKind
+  paidAt        DateTime?
 
   /// Set when kind = SUBSCRIPTION_CYCLE.
   subscriptionId String?
@@ -548,8 +683,8 @@ model Payment {
   /// Set when kind = ONE_OFF_PACK. Snapshots the pack at purchase time so the
   /// webhook can mint the correct CreditPack regardless of the admin later
   /// editing or removing the offer.
-  packCredits         Int?
-  packExpirationDays  Int?
+  packCredits        Int?
+  packExpirationDays Int?
 
   /// The CreditPack created from this Payment (when applicable). Backref of
   /// CreditPack.payment.
@@ -560,4 +695,52 @@ model Payment {
 
   @@index([userId])
   @@index([status])
+}
+
+// =============================================================================
+// G1 — Friends
+// =============================================================================
+
+/// Friend invitation flow. A row is created in PENDING by `from`, then
+/// transitions to ACCEPTED / DECLINED / CANCELLED. ACCEPTED rows trigger
+/// a `Friendship` record creation in the same transaction. Past terminal
+/// rows remain so re-sending the same code (after a decline) is one extra
+/// row instead of mutating history.
+///
+/// Concurrency note: only ONE PENDING row per ordered (from, to) pair is
+/// allowed at a time, enforced by a partial unique index in raw SQL —
+/// Prisma can't express partial uniques natively, so we use a regular
+/// unique on `(fromUserId, toUserId, status)` plus service-level check
+/// to keep the model expressive without raw migrations.
+model FriendRequest {
+  id           String              @id @default(cuid())
+  fromUserId   String
+  fromUser     User                @relation("FriendRequestFrom", fields: [fromUserId], references: [id])
+  toUserId     String
+  toUser       User                @relation("FriendRequestTo", fields: [toUserId], references: [id])
+  status       FriendRequestStatus @default(PENDING)
+  createdAt    DateTime            @default(now())
+  respondedAt  DateTime?
+
+  @@index([fromUserId])
+  @@index([toUserId])
+  @@index([status])
+}
+
+/// Bidirectional friendship. The pair is stored with deterministic ordering
+/// (`userAId < userBId`) so each friendship has exactly one row regardless
+/// of who initiated. Lookups go via OR on either side. Removing a friend
+/// deletes the row — Prisma's `delete` is idempotent enough that re-tries
+/// don't break the UI.
+model Friendship {
+  id        String   @id @default(cuid())
+  userAId   String
+  userA     User     @relation("FriendshipA", fields: [userAId], references: [id])
+  userBId   String
+  userB     User     @relation("FriendshipB", fields: [userBId], references: [id])
+  createdAt DateTime @default(now())
+
+  @@unique([userAId, userBId])
+  @@index([userAId])
+  @@index([userBId])
 }

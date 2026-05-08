@@ -33,6 +33,7 @@ describe('Admin CRUD (e2e)', () => {
   let instructorId: string;
   let bikeId: string;
   let classSlotId: string;
+  let testKindId: string;
 
   // startsAt must be in the future per the service's validation.
   const startsAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
@@ -79,6 +80,21 @@ describe('Admin CRUD (e2e)', () => {
       .send({ email: userEmail, password: userPassword, name: 'E2E User' })
       .expect(201);
     userToken = userSignup.body.accessToken;
+
+    // Ensure a ClassKind exists for instructor primaryClassKindId (C1).
+    // Slug uses the `e2e-` prefix so the cleanup() loop (and any global
+    // dev-DB sweep) drops it without leaking into the admin's tipo-de-aula
+    // list — see lessons.md for the original incident.
+    const kind = await prisma.classKind.upsert({
+      where: { slug: 'e2e-admin-kind' },
+      create: {
+        slug: 'e2e-admin-kind',
+        name: 'E2E Admin Kind',
+        defaultDurationMinutes: 45,
+      },
+      update: {},
+    });
+    testKindId = kind.id;
   });
 
   afterAll(async () => {
@@ -100,6 +116,9 @@ describe('Admin CRUD (e2e)', () => {
       where: { email: { startsWith: 'e2e-' } },
     });
     await prisma.unit.deleteMany({
+      where: { slug: { startsWith: 'e2e-' } },
+    });
+    await prisma.classKind.deleteMany({
       where: { slug: { startsWith: 'e2e-' } },
     });
   }
@@ -160,6 +179,8 @@ describe('Admin CRUD (e2e)', () => {
           name: 'E2E Instr',
           role: 'INSTRUCTOR',
           unitId,
+          bio: 'E2E test bio',
+          primaryClassKindId: testKindId,
         })
         .expect(201);
 
@@ -183,7 +204,7 @@ describe('Admin CRUD (e2e)', () => {
       const res = await request(server)
         .post('/bikes')
         .set('Authorization', `Bearer ${adminToken}`)
-        .send({ unitId, label: 'A1', positionX: 0, positionY: 0 })
+        .send({ unitId, label: 'A1', row: 'A', col: 1 })
         .expect(201);
 
       expect(res.body).toMatchObject({ unitId, label: 'A1', status: 'OPERATIONAL' });
@@ -291,6 +312,42 @@ describe('Admin CRUD (e2e)', () => {
         .expect(400);
     });
 
+    it('Wave C — capacity is auto-derived from operational bike count', async () => {
+      // Arena has 1 bike at this point (`bikeId` from earlier test). Slot
+      // create should produce capacity=1 regardless of the (now-ignored)
+      // payload.
+      const res = await request(server)
+        .post('/class-slots')
+        .set('Authorization', `Bearer ${instructorToken}`)
+        .send({
+          unitId,
+          instructorId,
+          startsAt: new Date(Date.now() + 60 * 3_600_000).toISOString(),
+          durationMinutes: 50,
+        })
+        .expect(201);
+      expect(res.body.capacity).toBe(1);
+
+      // Add a second bike and confirm a fresh slot has capacity=2.
+      await request(server)
+        .post('/bikes')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ unitId, label: 'A2', row: 'A', col: 2 })
+        .expect(201);
+
+      const res2 = await request(server)
+        .post('/class-slots')
+        .set('Authorization', `Bearer ${instructorToken}`)
+        .send({
+          unitId,
+          instructorId,
+          startsAt: new Date(Date.now() + 72 * 3_600_000).toISOString(),
+          durationMinutes: 50,
+        })
+        .expect(201);
+      expect(res2.body.capacity).toBe(2);
+    });
+
     it('reason=OUTRO without description returns 400', async () => {
       // Create a fresh slot to cancel
       const slot = await request(server)
@@ -310,6 +367,123 @@ describe('Admin CRUD (e2e)', () => {
         .set('Authorization', `Bearer ${instructorToken}`)
         .send({ kind: 'STUDIO', studioReason: 'OUTRO' })
         .expect(400);
+    });
+  });
+
+  describe('Wave C — instructor multi-arena (2026-05)', () => {
+    it('ADMIN creates an INSTRUCTOR with `unitIds` (M2M)', async () => {
+      // Create a second arena to assign the instructor to.
+      const arena2Slug = `e2e-arena2-${randomUUID().slice(0, 6)}`;
+      const arena2 = await request(server)
+        .post('/units')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          name: 'Arena 2 E2E',
+          slug: arena2Slug,
+          address: 'Praia 2',
+        })
+        .expect(201);
+
+      // The existing instructor from earlier was created with single
+      // `unitId`; create a brand-new one to test the multi-arena path.
+      const multiEmail = `e2e-multi-${randomUUID().slice(0, 8)}@test.local`;
+      const multiPassword = 'e2e-multi-12345';
+      const created = await request(server)
+        .post('/users/staff')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          email: multiEmail,
+          password: multiPassword,
+          name: 'E2E Multi',
+          role: 'INSTRUCTOR',
+          unitIds: [unitId, arena2.body.id],
+          bio: 'multi-arena bio',
+          primaryClassKindId: testKindId,
+        })
+        .expect(201);
+
+      expect(created.body.arenas).toHaveLength(2);
+      expect(
+        created.body.arenas.map((a: { id: string }) => a.id).sort(),
+      ).toEqual([unitId, arena2.body.id].sort());
+    });
+
+    it('listStaff filtered by unitId matches instructors via M2M', async () => {
+      // The instructor with single unitId from earlier appears via the
+      // legacy `User.unitId` filter. The multi-arena instructor created
+      // above must also appear via `arenaAssignments`.
+      const res = await request(server)
+        .get(`/users/staff?role=INSTRUCTOR&unitId=${unitId}`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200);
+      const emails = res.body.map((s: { email: string }) => s.email);
+      expect(emails).toContain(instructorEmail);
+      expect(emails.some((e: string) => e.startsWith('e2e-multi-'))).toBe(true);
+    });
+
+    it('Wave C — instructor without arena cannot be created', async () => {
+      const orphanEmail = `e2e-orphan-${randomUUID().slice(0, 6)}@test.local`;
+      await request(server)
+        .post('/users/staff')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          email: orphanEmail,
+          password: 'e2e-orphan-12345',
+          name: 'E2E Orphan',
+          role: 'INSTRUCTOR',
+          // No unitId / unitIds — should fail.
+          bio: 'orphan bio',
+          primaryClassKindId: testKindId,
+        })
+        .expect(400);
+    });
+
+    it('Wave C — bike soft-delete frees the (row, col) for a fresh bike', async () => {
+      // Add a bike, soft-delete it, then add another at the same position.
+      const created = await request(server)
+        .post('/bikes')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ unitId, label: 'B-DEL', row: 'B', col: 1 })
+        .expect(201);
+
+      await request(server)
+        .delete(`/bikes/${created.body.id}`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(204);
+
+      // Fresh bike at same position now succeeds (deletedAt frees the slot).
+      const fresh = await request(server)
+        .post('/bikes')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ unitId, label: 'B-FRESH', row: 'B', col: 1 })
+        .expect(201);
+      expect(fresh.body.row).toBe('B');
+      expect(fresh.body.col).toBe(1);
+
+      // Listing the unit's bikes excludes the soft-deleted one.
+      const list = await request(server)
+        .get(`/bikes?unitId=${unitId}&includeAll=true`)
+        .expect(200);
+      const ids = list.body.map((b: { id: string }) => b.id);
+      expect(ids).not.toContain(created.body.id);
+      expect(ids).toContain(fresh.body.id);
+    });
+
+    it('Wave C — old `swap-with` endpoint returns 404', async () => {
+      // The endpoint was removed; any caller hitting it should see a
+      // standard NestJS 404.
+      await request(server)
+        .post(`/bikes/${bikeId}/swap-with/${bikeId}`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(404);
+    });
+
+    it('Wave C — friends regenerate-code endpoint returns 404', async () => {
+      // We need ANY authed token; userToken works.
+      await request(server)
+        .post('/friends/regenerate-code')
+        .set('Authorization', `Bearer ${userToken}`)
+        .expect(404);
     });
   });
 

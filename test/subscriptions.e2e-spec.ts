@@ -200,9 +200,14 @@ describe('Subscriptions (e2e)', () => {
         userId,
         planId: activePlanId,
         asaasSubscriptionId: 'sub_test_1',
-        status: 'ACTIVE',
+        status: 'PENDING_PAYMENT',
       });
       expect(res.body.plan.monthlyCredits).toBe(8);
+
+      const credits = await prisma.creditPack.count({
+        where: { userId, source: 'SUBSCRIPTION_CYCLE' },
+      });
+      expect(credits).toBe(0);
 
       // currentPeriodEnd should be ~30 days after currentPeriodStart
       const start = new Date(res.body.currentPeriodStart).getTime();
@@ -229,7 +234,7 @@ describe('Subscriptions (e2e)', () => {
       );
     });
 
-    it('subscribing again while one is ACTIVE → 409', async () => {
+    it('subscribing again while first payment is pending → 409', async () => {
       await request(server)
         .post('/subscriptions')
         .set('Authorization', `Bearer ${userToken}`)
@@ -240,13 +245,11 @@ describe('Subscriptions (e2e)', () => {
 
   describe('Webhook — subscription cycle Payment lifecycle', () => {
     let createdPaymentId: string;
-    let originalCycleEnd: Date;
-
-    it('captures the subscription\'s current cycle end before any webhook fires', async () => {
+    it('subscription remains pending before any payment webhook fires', async () => {
       const sub = await prisma.subscription.findFirst({
         where: { userId, asaasSubscriptionId: 'sub_test_1' },
       });
-      originalCycleEnd = sub!.currentPeriodEnd;
+      expect(sub?.status).toBe('PENDING_PAYMENT');
     });
 
     it('PAYMENT_CREATED for subscription cycle → upserts local Payment SUBSCRIPTION_CYCLE PENDING', async () => {
@@ -307,7 +310,7 @@ describe('Subscriptions (e2e)', () => {
       expect(after).toBe(before);
     });
 
-    it('PAYMENT_CONFIRMED → Payment PAID + CreditPack source=SUBSCRIPTION_CYCLE with expiresAt = previous cycle end', async () => {
+    it('PAYMENT_CONFIRMED → Payment PAID + Subscription ACTIVE + CreditPack for first paid cycle', async () => {
       await request(server)
         .post('/asaas/webhook')
         .set('asaas-access-token', WEBHOOK_TOKEN)
@@ -339,19 +342,16 @@ describe('Subscriptions (e2e)', () => {
         remainingCredits: 8,
       });
       expect(pack?.subscriptionId).toBeTruthy();
-      // Pack expires at the cycle end the user paid for
-      expect(pack?.expiresAt?.getTime()).toBe(originalCycleEnd.getTime());
+      const expectedExpiry =
+        new Date(payment!.paidAt!).getTime() + 27 * 86_400_000;
+      expect(pack!.expiresAt!.getTime()).toBeGreaterThan(expectedExpiry);
     });
 
     it('Subscription cycle window advances by 1 month for next cycle', async () => {
       const sub = await prisma.subscription.findFirst({
         where: { userId, asaasSubscriptionId: 'sub_test_1' },
       });
-      // currentPeriodStart is now what was currentPeriodEnd
-      expect(sub?.currentPeriodStart.getTime()).toBe(
-        originalCycleEnd.getTime(),
-      );
-      // currentPeriodEnd has moved ~30 days further
+      expect(sub?.status).toBe('ACTIVE');
       const days =
         (sub!.currentPeriodEnd.getTime() -
           sub!.currentPeriodStart.getTime()) /
@@ -408,6 +408,112 @@ describe('Subscriptions (e2e)', () => {
         where: { asaasChargeId: 'pay_orphan' },
       });
       expect(orphan).toBeNull();
+    });
+
+    it('PAYMENT_RECEIVED without prior PAYMENT_CREATED still creates the cycle payment + credits', async () => {
+      await request(server)
+        .post('/asaas/webhook')
+        .set('asaas-access-token', WEBHOOK_TOKEN)
+        .send({
+          event: 'PAYMENT_RECEIVED',
+          payment: {
+            id: 'pay_sub_cycle_out_of_order',
+            customer: 'cus_sub_test_1',
+            subscription: 'sub_test_1',
+            billingType: 'PIX',
+            status: 'RECEIVED',
+            value: 199,
+          },
+        })
+        .expect(200);
+
+      const payment = await prisma.payment.findUnique({
+        where: { asaasChargeId: 'pay_sub_cycle_out_of_order' },
+      });
+      expect(payment).toMatchObject({
+        userId,
+        kind: 'SUBSCRIPTION_CYCLE',
+        status: 'PAID',
+        amountCents: 19900,
+        method: 'PIX',
+      });
+
+      const pack = await prisma.creditPack.findFirst({
+        where: { paymentId: payment!.id },
+      });
+      expect(pack).toMatchObject({
+        userId,
+        source: 'SUBSCRIPTION_CYCLE',
+        totalCredits: 8,
+        remainingCredits: 8,
+      });
+    });
+
+    it('PAYMENT_OVERDUE marks subscription PAST_DUE; later PAYMENT_RECEIVED restores ACTIVE', async () => {
+      await request(server)
+        .post('/asaas/webhook')
+        .set('asaas-access-token', WEBHOOK_TOKEN)
+        .send({
+          event: 'PAYMENT_OVERDUE',
+          payment: {
+            id: 'pay_sub_cycle_late',
+            customer: 'cus_sub_test_1',
+            subscription: 'sub_test_1',
+            billingType: 'PIX',
+            status: 'OVERDUE',
+            value: 199,
+          },
+        })
+        .expect(200);
+
+      const pastDue = await prisma.subscription.findFirst({
+        where: { userId, asaasSubscriptionId: 'sub_test_1' },
+      });
+      expect(pastDue?.status).toBe('PAST_DUE');
+
+      await request(server)
+        .post('/asaas/webhook')
+        .set('asaas-access-token', WEBHOOK_TOKEN)
+        .send({
+          event: 'PAYMENT_RECEIVED',
+          payment: {
+            id: 'pay_sub_cycle_late',
+            customer: 'cus_sub_test_1',
+            subscription: 'sub_test_1',
+            billingType: 'PIX',
+            status: 'RECEIVED',
+            value: 199,
+          },
+        })
+        .expect(200);
+
+      const activeAgain = await prisma.subscription.findFirst({
+        where: { userId, asaasSubscriptionId: 'sub_test_1' },
+      });
+      expect(activeAgain?.status).toBe('ACTIVE');
+
+      const payment = await prisma.payment.findUnique({
+        where: { asaasChargeId: 'pay_sub_cycle_late' },
+      });
+      expect(payment?.status).toBe('PAID');
+    });
+
+    it('PAST_DUE subscription still blocks creating a second monthly subscription', async () => {
+      await prisma.subscription.updateMany({
+        where: { userId, asaasSubscriptionId: 'sub_test_1' },
+        data: { status: 'PAST_DUE' },
+      });
+
+      await request(server)
+        .post('/subscriptions')
+        .set('Authorization', `Bearer ${userToken}`)
+        .send({ planId: activePlanId })
+        .expect(409);
+
+      await prisma.subscription.updateMany({
+        where: { userId, asaasSubscriptionId: 'sub_test_1' },
+        data: { status: 'ACTIVE' },
+      });
     });
   });
 
@@ -478,7 +584,10 @@ describe('Subscriptions (e2e)', () => {
     it('cancelling someone else\'s subscription returns 403', async () => {
       // noCpfToken belongs to a user with no subscription. Try cancelling u1's.
       const u1Subs = await prisma.subscription.findMany({
-        where: { userId, status: 'ACTIVE' },
+        where: {
+          userId,
+          status: { in: ['PENDING_PAYMENT', 'ACTIVE', 'PAST_DUE'] },
+        },
       });
       await request(server)
         .delete(`/subscriptions/${u1Subs[0].id}`)

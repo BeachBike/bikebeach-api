@@ -1,6 +1,7 @@
 import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PassportStrategy } from '@nestjs/passport';
+import { Role } from '@prisma/client';
 import { ExtractJwt, Strategy } from 'passport-jwt';
 import { PrismaService } from '../../prisma/prisma.service';
 import type { AuthenticatedUser } from '../../common/types/authenticated-user.type';
@@ -28,6 +29,10 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
         role: true,
         unitId: true,
         isActive: true,
+        arenaAssignments:
+          // INSTRUCTOR is the only role that uses the M2M for tenancy
+          // checks; skip the join for everyone else.
+          { select: { unitId: true } },
       },
     });
     if (!user || !user.isActive) {
@@ -38,6 +43,10 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       email: user.email,
       role: user.role,
       unitId: user.unitId,
+      instructorArenaIds:
+        user.role === Role.INSTRUCTOR
+          ? user.arenaAssignments.map((a) => a.unitId)
+          : [],
     };
   }
 }

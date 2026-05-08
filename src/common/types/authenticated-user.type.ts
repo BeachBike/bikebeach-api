@@ -7,4 +7,9 @@ export interface AuthenticatedUser {
   email: string;
   role: Role;
   unitId: string | null;
+  /// 2026-05 — INSTRUCTOR multi-arena. Mirrors the `InstructorArena`
+  /// rows for the user. Empty for ADMIN/USER. Tenancy checks for
+  /// instructors look here first; the legacy `unitId` is just the
+  /// primary arena pointer.
+  instructorArenaIds: string[];
 }

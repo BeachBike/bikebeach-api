@@ -9,16 +9,20 @@ export function isGlobalAdmin(user: AuthenticatedUser): boolean {
 
 /// Asserts the user can read/write resources scoped to `unitId`.
 /// - Global admins (ADMIN, no unitId): always pass.
-/// - Unit-scoped staff (ADMIN/INSTRUCTOR with matching unitId): pass.
+/// - Unit-scoped ADMIN with matching `unitId`: pass.
+/// - INSTRUCTOR whose `InstructorArena` set includes `unitId`: pass.
+///   (2026-05 multi-arena — `user.unitId` is just the legacy primary
+///   pointer, so we check the M2M list instead.)
 /// - Anyone else (regular USER, staff of a different unit): 403.
 export function assertCanAccessUnit(
   user: AuthenticatedUser,
   unitId: string,
 ): void {
   if (isGlobalAdmin(user)) return;
+  if (user.role === Role.ADMIN && user.unitId === unitId) return;
   if (
-    (user.role === Role.ADMIN || user.role === Role.INSTRUCTOR) &&
-    user.unitId === unitId
+    user.role === Role.INSTRUCTOR &&
+    user.instructorArenaIds.includes(unitId)
   ) {
     return;
   }
@@ -38,7 +42,7 @@ export function assertCanManageSlot(
   if (
     user.role === Role.INSTRUCTOR &&
     slot.instructorId === user.id &&
-    user.unitId === slot.unitId
+    user.instructorArenaIds.includes(slot.unitId)
   ) {
     return;
   }

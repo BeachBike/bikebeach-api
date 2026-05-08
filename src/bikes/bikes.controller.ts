@@ -58,13 +58,19 @@ export class BikesController {
     return this.bikes.update(id, dto, user);
   }
 
+  /// 2026-05 — soft-delete via `deletedAt`. The bike disappears from every
+  /// list / seat-map but stays in the DB so historical reservations
+  /// resolve. The position is freed for a new bike to be cadastrada.
+  /// (The old `swap-with` endpoint was removed — admin moves bikes via
+  /// PATCH `:id` with new row/col, since positions are now assignable
+  /// only to empty cells.)
   @Roles(Role.ADMIN)
   @Delete(':id')
   @HttpCode(HttpStatus.NO_CONTENT)
-  async deactivate(
+  async softDelete(
     @Param('id') id: string,
     @CurrentUser() user: AuthenticatedUser,
   ): Promise<void> {
-    await this.bikes.deactivate(id, user);
+    await this.bikes.softDelete(id, user);
   }
 }

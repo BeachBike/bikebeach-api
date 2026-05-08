@@ -36,6 +36,10 @@ export class AsaasClientService {
     return this.request<AsaasPayment>('POST', '/payments', payload);
   }
 
+  getPayment(paymentId: string): Promise<AsaasPayment> {
+    return this.request<AsaasPayment>('GET', `/payments/${paymentId}`);
+  }
+
   getPixQrCode(paymentId: string): Promise<AsaasPixQrCode> {
     return this.request<AsaasPixQrCode>(
       'GET',
@@ -58,6 +62,12 @@ export class AsaasClientService {
     path: string,
     body?: unknown,
   ): Promise<T> {
+    if (body && method !== 'GET') {
+      this.logger.debug(`[Asaas] Sending ${method} ${path}`, {
+        body,
+      });
+    }
+    
     const res = await fetch(`${this.baseUrl}${path}`, {
       method,
       headers: {
@@ -66,11 +76,18 @@ export class AsaasClientService {
       },
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
+    
     if (!res.ok) {
       const text = await res.text();
-      this.logger.error(`Asaas ${method} ${path} → ${res.status}: ${text}`);
+      this.logger.error(`[Asaas] ${method} ${path} → ${res.status}`, {
+        error: text,
+        request: body,
+      });
       throw new Error(`Asaas API error (${res.status}): ${text}`);
     }
-    return (await res.json()) as T;
+    
+    const data = (await res.json()) as T;
+    this.logger.debug(`[Asaas] Response ${method} ${path}`, { data });
+    return data;
   }
 }

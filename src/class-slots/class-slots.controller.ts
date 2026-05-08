@@ -14,8 +14,10 @@ import { Public } from '../common/decorators/public.decorator';
 import { Roles } from '../common/decorators/roles.decorator';
 import type { AuthenticatedUser } from '../common/types/authenticated-user.type';
 import { ClassSlotsService } from './class-slots.service';
+import { BulkCheckInDto } from './dto/bulk-check-in.dto';
 import { CancelClassSlotDto } from './dto/cancel-class-slot.dto';
 import { CreateClassSlotDto } from './dto/create-class-slot.dto';
+import { FriendsAttendingBatchDto } from './dto/friends-attending-batch.dto';
 import { UpdateClassSlotDto } from './dto/update-class-slot.dto';
 
 @Controller('class-slots')
@@ -65,6 +67,12 @@ export class ClassSlotsController {
   }
 
   @Roles(Role.ADMIN, Role.INSTRUCTOR)
+  @Get(':id/roster')
+  roster(@Param('id') id: string, @CurrentUser() user: AuthenticatedUser) {
+    return this.slots.roster(id, user);
+  }
+
+  @Roles(Role.ADMIN, Role.INSTRUCTOR)
   @Patch(':id')
   update(
     @Param('id') id: string,
@@ -82,5 +90,35 @@ export class ClassSlotsController {
     @CurrentUser() user: AuthenticatedUser,
   ) {
     return this.slots.cancel(id, dto, user);
+  }
+
+  @Roles(Role.ADMIN, Role.INSTRUCTOR)
+  @Post(':id/confirm-start')
+  confirmStart(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.slots.confirmStart(id, user);
+  }
+
+  @Roles(Role.ADMIN, Role.INSTRUCTOR)
+  @Post(':id/bulk-check-in')
+  bulkCheckIn(
+    @Param('id') id: string,
+    @Body() dto: BulkCheckInDto,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.slots.bulkCheckIn(id, dto.presentReservationIds, user);
+  }
+
+  /// Authenticated overlay: returns which of the caller's friends are on
+  /// each of the supplied slots. Batched so the day-picker on /reservar
+  /// can issue one call instead of N.
+  @Post('friends-attending-batch')
+  friendsAttendingBatch(
+    @Body() dto: FriendsAttendingBatchDto,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.slots.friendsAttendingBatch(dto.slotIds, user);
   }
 }

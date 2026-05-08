@@ -5,6 +5,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
+import { validateDiscountWindow } from '../common/discount';
 import { assertCanAccessUnit } from '../common/tenancy';
 import type { AuthenticatedUser } from '../common/types/authenticated-user.type';
 import { PrismaService } from '../prisma/prisma.service';
@@ -25,8 +26,23 @@ export class PackOffersService {
       throw new BadRequestException('Unidade inválida ou inativa');
     }
 
+    const discount = validateDiscountWindow(dto);
+    const data: Prisma.PackOfferCreateInput = {
+      unit: { connect: { id: dto.unitId } },
+      classes: dto.classes,
+      priceCents: dto.priceCents,
+      expirationDays: dto.expirationDays,
+      ...(dto.isActive !== undefined && { isActive: dto.isActive }),
+      ...(dto.displayOrder !== undefined && { displayOrder: dto.displayOrder }),
+      ...(discount && {
+        discountPercent: discount.discountPercent,
+        discountStartsAt: discount.discountStartsAt,
+        discountEndsAt: discount.discountEndsAt,
+      }),
+    };
+
     try {
-      return await this.prisma.packOffer.create({ data: dto });
+      return await this.prisma.packOffer.create({ data });
     } catch (err) {
       if (
         err instanceof Prisma.PrismaClientKnownRequestError &&
@@ -67,7 +83,18 @@ export class PackOffersService {
   async update(id: string, dto: UpdatePackOfferDto, user: AuthenticatedUser) {
     const existing = await this.findOne(id);
     assertCanAccessUnit(user, existing.unitId);
-    return this.prisma.packOffer.update({ where: { id }, data: dto });
+    const discount = validateDiscountWindow(dto);
+    const data: Prisma.PackOfferUpdateInput = {};
+    if (dto.priceCents !== undefined) data.priceCents = dto.priceCents;
+    if (dto.expirationDays !== undefined) data.expirationDays = dto.expirationDays;
+    if (dto.isActive !== undefined) data.isActive = dto.isActive;
+    if (dto.displayOrder !== undefined) data.displayOrder = dto.displayOrder;
+    if (discount) {
+      data.discountPercent = discount.discountPercent;
+      data.discountStartsAt = discount.discountStartsAt;
+      data.discountEndsAt = discount.discountEndsAt;
+    }
+    return this.prisma.packOffer.update({ where: { id }, data });
   }
 
   async remove(id: string, user: AuthenticatedUser) {

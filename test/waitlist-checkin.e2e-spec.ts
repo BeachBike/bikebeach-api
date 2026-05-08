@@ -92,12 +92,23 @@ describe('Waitlist + check-in (e2e)', () => {
       })
     ).id;
 
+    const testKind = await prisma.classKind.upsert({
+      where: { slug: 'e2e-wl-kind' },
+      create: {
+        slug: 'e2e-wl-kind',
+        name: 'WL Kind',
+        defaultDurationMinutes: 45,
+      },
+      update: {},
+    });
     const instructor = await api('post', '/users/staff', adminToken, {
       email: instructorEmail,
       password,
       name: 'WL Instr',
       role: 'INSTRUCTOR',
       unitId,
+      bio: 'WL bio',
+      primaryClassKindId: testKind.id,
     });
     instructorId = instructor.id;
     instructorToken = (await login(instructorEmail, password)).accessToken;
@@ -105,14 +116,15 @@ describe('Waitlist + check-in (e2e)', () => {
     bikeId = (await api('post', '/bikes', adminToken, { unitId, label: 'B1' }))
       .id;
 
-    // Slots
-    const farFuture = () =>
-      new Date(Date.now() + 24 * 3_600_000).toISOString();
+    // Slots — staggered an hour apart so the per-arena overlap check (14.2)
+    // doesn't reject them.
+    const farFuture = (offsetHours: number) =>
+      new Date(Date.now() + (24 + offsetHours) * 3_600_000).toISOString();
     slotEmptyId = (
       await api('post', '/class-slots', instructorToken, {
         unitId,
         instructorId,
-        startsAt: farFuture(),
+        startsAt: farFuture(0),
         durationMinutes: 50,
         capacity: 10,
       })
@@ -121,7 +133,7 @@ describe('Waitlist + check-in (e2e)', () => {
       await api('post', '/class-slots', instructorToken, {
         unitId,
         instructorId,
-        startsAt: farFuture(),
+        startsAt: farFuture(2),
         durationMinutes: 50,
         capacity: 1,
       })
@@ -130,7 +142,7 @@ describe('Waitlist + check-in (e2e)', () => {
       await api('post', '/class-slots', instructorToken, {
         unitId,
         instructorId,
-        startsAt: farFuture(),
+        startsAt: farFuture(4),
         durationMinutes: 50,
         capacity: 1,
       })
@@ -189,6 +201,9 @@ describe('Waitlist + check-in (e2e)', () => {
       where: { email: { startsWith: 'e2e-wl-' } },
     });
     await prisma.unit.deleteMany({
+      where: { slug: { startsWith: 'e2e-wl-' } },
+    });
+    await prisma.classKind.deleteMany({
       where: { slug: { startsWith: 'e2e-wl-' } },
     });
   }

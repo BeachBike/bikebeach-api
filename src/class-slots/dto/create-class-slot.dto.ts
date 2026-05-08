@@ -36,8 +36,11 @@ export class CreateClassSlotDto {
   @Max(180)
   durationMinutes?: number;
 
+  /// Optional. When omitted, falls back to the arena's `defaultCapacity`
+  /// (14.5). Per-slot override is allowed.
+  @IsOptional()
   @IsInt()
   @Min(1)
-  @Max(100)
-  capacity!: number;
+  @Max(200)
+  capacity?: number;
 }

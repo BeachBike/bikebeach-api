@@ -15,6 +15,7 @@ import {
 } from '@prisma/client';
 import {
   BOOKING_WINDOW_DAYS,
+  MIN_RESERVATION_LEAD_MINUTES,
   REFUND_PACK_VALIDITY_DAYS,
   STANDARD_CANCELLATION_WINDOW_HOURS,
   WAITLIST_PROTECTED_CANCELLATION_WINDOW_HOURS,
@@ -52,9 +53,37 @@ export class ReservationsService {
     if (slot.startsAt.getTime() <= now) {
       throw new BadRequestException('Aula já começou ou está no passado');
     }
+    if (
+      slot.startsAt.getTime() - now <
+      MIN_RESERVATION_LEAD_MINUTES * 60_000
+    ) {
+      throw new BadRequestException(
+        `Reservas fecham ${MIN_RESERVATION_LEAD_MINUTES} min antes da aula`,
+      );
+    }
     if (slot.startsAt.getTime() - now > BOOKING_WINDOW_DAYS * 86_400_000) {
       throw new BadRequestException(
         `Reservas abrem ${BOOKING_WINDOW_DAYS} dias antes da aula`,
+      );
+    }
+
+    // Block double-booking: one user can hold at most one ACTIVE/CHECKED_IN
+    // reservation per slot, regardless of which bike. This is separate from
+    // the (slot, bike) `activeKey` unique — two different users would still
+    // be allowed on the same slot.
+    const myExisting = await this.prisma.reservation.findFirst({
+      where: {
+        userId: user.id,
+        classSlotId: slot.id,
+        status: {
+          in: [ReservationStatus.ACTIVE, ReservationStatus.CHECKED_IN],
+        },
+      },
+      select: { id: true },
+    });
+    if (myExisting) {
+      throw new ConflictException(
+        'Você já tem uma reserva nessa aula. Use trocar bike pra mudar.',
       );
     }
 
@@ -236,6 +265,129 @@ export class ReservationsService {
     };
   }
 
+  /// Change the bike of an existing reservation while keeping the credit
+  /// already consumed. Allowed only outside the standard cancellation window
+  /// (≥ 8h before class) — within the window a swap could be used to rotate
+  /// between bikes and dodge the 8h rule entirely.
+  ///
+  /// Owner-only (admins use the cancel/recreate flow). Returns the updated
+  /// reservation. Concurrency on the destination (slot, bike) returns 409
+  /// just like the create flow does.
+  async changeBike(
+    reservationId: string,
+    newBikeId: string,
+    user: AuthenticatedUser,
+  ) {
+    const reservation = await this.prisma.reservation.findUnique({
+      where: { id: reservationId },
+      include: { classSlot: true },
+    });
+    if (!reservation) throw new NotFoundException('Reserva não encontrada');
+    if (reservation.userId !== user.id) {
+      throw new ForbiddenException('Você não pode editar essa reserva');
+    }
+    if (reservation.status !== ReservationStatus.ACTIVE) {
+      throw new BadRequestException('Reserva não está ativa');
+    }
+    if (reservation.classSlot.status !== ClassSlotStatus.SCHEDULED) {
+      throw new BadRequestException('Aula não está aberta para edição');
+    }
+
+    const now = Date.now();
+    const hoursToClass =
+      (reservation.classSlot.startsAt.getTime() - now) / 3_600_000;
+    if (hoursToClass < STANDARD_CANCELLATION_WINDOW_HOURS) {
+      throw new BadRequestException(
+        `Trocar bike só até ${STANDARD_CANCELLATION_WINDOW_HOURS}h antes da aula`,
+      );
+    }
+
+    if (newBikeId === reservation.bikeId) {
+      throw new BadRequestException('Essa já é a bike atual');
+    }
+
+    const newBike = await this.prisma.bike.findUnique({
+      where: { id: newBikeId },
+    });
+    if (!newBike || newBike.status !== BikeStatus.OPERATIONAL) {
+      throw new BadRequestException('Bike inválida ou indisponível');
+    }
+    if (newBike.unitId !== reservation.classSlot.unitId) {
+      throw new BadRequestException(
+        'Bike não pertence à unidade dessa aula',
+      );
+    }
+
+    try {
+      return await this.prisma.reservation.update({
+        where: { id: reservationId },
+        data: {
+          bikeId: newBikeId,
+          activeKey: this.activeKeyFor(reservation.classSlotId, newBikeId),
+        },
+      });
+    } catch (err) {
+      if (
+        err instanceof Prisma.PrismaClientKnownRequestError &&
+        err.code === 'P2002'
+      ) {
+        throw new ConflictException(
+          'Bike já reservada por outro usuário para essa aula',
+        );
+      }
+      throw err;
+    }
+  }
+
+  /// User self-marks themselves as a no-show. Use case: they realised
+  /// after the start that they can't make it; rather than ghost the slot,
+  /// they record a reason. The credit is forfeit (the seat blocked someone
+  /// else) — this mirrors the silent NO_SHOW the cron applies after the
+  /// check-in window closes, but with an attached `cancellationReason`.
+  ///
+  /// Allowed only while the reservation is ACTIVE on a SCHEDULED slot
+  /// inside its run window (between `startsAt` and `startsAt + duration`).
+  /// Outside that window the cron has already moved the row, and there's
+  /// nothing to set.
+  async selfNoShow(
+    reservationId: string,
+    reason: string,
+    user: AuthenticatedUser,
+  ) {
+    const reservation = await this.prisma.reservation.findUnique({
+      where: { id: reservationId },
+      include: { classSlot: true },
+    });
+    if (!reservation) throw new NotFoundException('Reserva não encontrada');
+    if (reservation.userId !== user.id) {
+      throw new ForbiddenException('Você não pode marcar essa reserva');
+    }
+    if (reservation.status !== ReservationStatus.ACTIVE) {
+      throw new BadRequestException(
+        'Marca ausência só funciona em reservas ativas',
+      );
+    }
+    if (reservation.classSlot.status !== ClassSlotStatus.SCHEDULED) {
+      throw new BadRequestException('Aula não está em andamento');
+    }
+
+    const trimmed = reason.trim();
+    if (trimmed.length < 3) {
+      throw new BadRequestException(
+        'Justificativa muito curta (mín. 3 caracteres)',
+      );
+    }
+
+    return this.prisma.reservation.update({
+      where: { id: reservationId },
+      data: {
+        status: ReservationStatus.NO_SHOW,
+        activeKey: null, // releases the (slot, bike) constraint slot
+        cancellationReason: trimmed,
+      },
+    });
+  }
+
   async checkIn(reservationId: string, user: AuthenticatedUser) {
     const reservation = await this.prisma.reservation.findUnique({
       where: { id: reservationId },
@@ -289,7 +441,9 @@ export class ReservationsService {
   /// all commit-or-rollback together.
   async bulkCancelByStudio(
     slotId: string,
-    cancelledByUserId: string,
+    /// `null` when triggered by an automated job (no human canceller).
+    /// Schema column is nullable so we just store null.
+    cancelledByUserId: string | null,
     tx: Prisma.TransactionClient,
   ): Promise<{ cancelled: number; refunded: number }> {
     const reservations = await tx.reservation.findMany({

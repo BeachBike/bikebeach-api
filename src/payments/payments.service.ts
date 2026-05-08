@@ -9,10 +9,13 @@ import {
   PaymentKind,
   PaymentMethod,
   PaymentStatus,
+  SubscriptionStatus,
 } from '@prisma/client';
 import { AsaasClientService } from '../asaas/asaas-client.service';
 import type { AsaasPayment } from '../asaas/asaas-client.types';
 import { AsaasCustomersService } from '../asaas/asaas-customers.service';
+import { PIX_DISCOUNT_PERCENT } from '../common/constants';
+import { computeCampaignDiscountCents } from '../common/discount';
 import { PrismaService } from '../prisma/prisma.service';
 
 export interface CreatePixPackResult {
@@ -20,6 +23,11 @@ export interface CreatePixPackResult {
   asaasChargeId: string;
   amountCents: number;
   basePriceCents: number;
+  /// Campaign (admin-configured) discount in cents — applied first.
+  /// Zero when no active campaign on the offer.
+  campaignDiscountCents: number;
+  /// PIX off (system-wide constant after 2026-05). Applied AFTER the
+  /// campaign discount on the already-discounted price.
   pixDiscountPercent: number;
   pix: {
     qrCodeImage: string;
@@ -59,28 +67,69 @@ export class PaymentsService {
     // ensureCustomer also throws 400 CPF_REQUIRED when missing.
     const customerId = await this.customers.ensureCustomer(user);
 
+    // Discount campaign on the pack offer (C3) compounds with the PIX
+    // off (item-14): apply the campaign first, then the PIX 5% on the
+    // already-discounted amount. PIX percent is now a system-wide
+    // constant (no longer per-arena).
     const basePriceCents = offer.priceCents;
-    const pixDiscountPercent = offer.unit.pixDiscountPercent;
+    const campaignDiscountCents = computeCampaignDiscountCents(offer);
+    const priceAfterCampaign = basePriceCents - campaignDiscountCents;
+    const pixDiscountPercent = PIX_DISCOUNT_PERCENT;
+
+    this.logger.debug('Payment calculation:', {
+      basePriceCents,
+      campaignDiscountCents,
+      pixDiscountPercent,
+      packClasses: offer.classes,
+    });
+
     // Round to whole cents so Asaas + accounting agree on the charge value.
     const discountCents = Math.round(
-      (basePriceCents * pixDiscountPercent) / 100,
+      (priceAfterCampaign * pixDiscountPercent) / 100,
     );
-    const amountCents = basePriceCents - discountCents;
+    const amountCents = priceAfterCampaign - discountCents;
+
+    if (amountCents <= 0) {
+      throw new BadRequestException({
+        code: 'INVALID_AMOUNT',
+        message: 'Valor inválido para o pacote. Contate o suporte.',
+      });
+    }
 
     const dueDate = new Date();
     dueDate.setDate(dueDate.getDate() + 1);
     const dueDateStr = dueDate.toISOString().slice(0, 10); // YYYY-MM-DD
 
-    const charge = await this.asaas.createPayment({
+    const paymentPayload = {
       customer: customerId,
-      billingType: 'PIX',
+      billingType: 'PIX' as const,
       value: amountCents / 100,
       dueDate: dueDateStr,
       description:
         pixDiscountPercent > 0
           ? `Pacote ${offer.classes} aula${offer.classes > 1 ? 's' : ''} (PIX -${pixDiscountPercent}%)`
           : `Pacote ${offer.classes} aula${offer.classes > 1 ? 's' : ''}`,
+    };
+
+    this.logger.debug('Creating PIX payment with payload:', {
+      customer: customerId,
+      value: paymentPayload.value,
+      dueDate: dueDateStr,
     });
+
+    const charge = await this.asaas.createPayment(paymentPayload);
+    
+    this.logger.debug('Asaas payment created:', {
+      id: charge.id,
+      billingType: charge.billingType,
+      status: charge.status,
+    });
+
+    if (charge.billingType !== 'PIX') {
+      this.logger.error(
+        `Payment was created with billingType=${charge.billingType}, but requested PIX. This may indicate the Asaas account does not have PIX enabled.`,
+      );
+    }
 
     const payment = await this.prisma.payment.create({
       data: {
@@ -95,13 +144,37 @@ export class PaymentsService {
       },
     });
 
-    const qr = await this.asaas.getPixQrCode(charge.id);
+    let qr;
+    try {
+      qr = await this.asaas.getPixQrCode(charge.id);
+    } catch (err) {
+      // If PIX QR code generation fails, it's likely the payment wasn't actually
+      // created as PIX. This usually means:
+      // 1. The Asaas account doesn't have PIX enabled
+      // 2. There's a mismatch in the API request/response
+      // 3. Sandbox limitations
+      this.logger.error('Failed to generate PIX QR code for payment:', {
+        paymentId: charge.id,
+        error: err instanceof Error ? err.message : String(err),
+        billingType: charge.billingType,
+      });
+      
+      // Delete the local payment record since we can't complete the PIX flow
+      await this.prisma.payment.delete({ where: { id: payment.id } });
+      
+      throw new BadRequestException({
+        code: 'PIX_UNAVAILABLE',
+        message:
+          'Não foi possível gerar QR code para PIX. Verifique se a conta está habilitada para PIX ou tente outro método de pagamento.',
+      });
+    }
 
     return {
       paymentId: payment.id,
       asaasChargeId: charge.id,
       amountCents,
       basePriceCents,
+      campaignDiscountCents,
       pixDiscountPercent,
       pix: {
         qrCodeImage: qr.encodedImage,
@@ -117,9 +190,15 @@ export class PaymentsService {
   /// first transition to PAID — handles both `ONE_OFF_PACK` and
   /// `SUBSCRIPTION_CYCLE` payments.
   async applyPaymentConfirmation(asaasPayment: AsaasPayment): Promise<void> {
-    const local = await this.prisma.payment.findUnique({
+    let local = await this.prisma.payment.findUnique({
       where: { asaasChargeId: asaasPayment.id },
     });
+    if (!local && asaasPayment.subscription) {
+      await this.upsertSubscriptionCyclePayment(asaasPayment);
+      local = await this.prisma.payment.findUnique({
+        where: { asaasChargeId: asaasPayment.id },
+      });
+    }
     if (!local) {
       this.logger.warn(
         `Webhook for unknown asaasChargeId=${asaasPayment.id}; ignoring`,
@@ -169,6 +248,15 @@ export class PaymentsService {
           return;
         }
 
+        const paidAt = new Date();
+        const isFirstPaidCycle =
+          sub.status === SubscriptionStatus.PENDING_PAYMENT;
+        const paidCycleStart = isFirstPaidCycle
+          ? paidAt
+          : sub.currentPeriodEnd;
+        const paidCycleEnd = new Date(paidCycleStart);
+        paidCycleEnd.setMonth(paidCycleEnd.getMonth() + 1);
+
         // Credits expire at the END of the cycle being paid for.
         await tx.creditPack.create({
           data: {
@@ -178,20 +266,16 @@ export class PaymentsService {
             remainingCredits: sub.plan.monthlyCredits,
             subscriptionId: sub.id,
             paymentId: local.id,
-            expiresAt: sub.currentPeriodEnd,
+            expiresAt: paidCycleEnd,
           },
         });
 
-        // Advance cycle: anchor on the CURRENT period end so cadence is
-        // preserved even when payment is delayed.
-        const nextStart = sub.currentPeriodEnd;
-        const nextEnd = new Date(nextStart);
-        nextEnd.setMonth(nextEnd.getMonth() + 1);
         await tx.subscription.update({
           where: { id: sub.id },
           data: {
-            currentPeriodStart: nextStart,
-            currentPeriodEnd: nextEnd,
+            status: SubscriptionStatus.ACTIVE,
+            currentPeriodStart: paidCycleStart,
+            currentPeriodEnd: paidCycleEnd,
           },
         });
       }
@@ -241,10 +325,62 @@ export class PaymentsService {
     });
   }
 
+  async applyPaymentOverdue(asaasPayment: AsaasPayment): Promise<void> {
+    if (!asaasPayment.subscription) return;
+
+    await this.upsertSubscriptionCyclePayment(asaasPayment);
+
+    const sub = await this.prisma.subscription.findUnique({
+      where: { asaasSubscriptionId: asaasPayment.subscription },
+    });
+    if (!sub) return;
+
+    await this.prisma.subscription.update({
+      where: { id: sub.id },
+      data: { status: SubscriptionStatus.PAST_DUE },
+    });
+  }
+
   async findMine(userId: string) {
     return this.prisma.payment.findMany({
       where: { userId },
       orderBy: { createdAt: 'desc' },
     });
+  }
+
+  /// Owner-only single-payment lookup. Used by the checkout page to poll for
+  /// `status: PAID` after the user finishes paying via Pix.
+  async findOneForUser(id: string, userId: string) {
+    let payment = await this.prisma.payment.findUnique({ where: { id } });
+    if (!payment) throw new NotFoundException('Pagamento não encontrado');
+    if (payment.userId !== userId) {
+      throw new NotFoundException('Pagamento não encontrado');
+    }
+    if (payment.status === PaymentStatus.PENDING) {
+      await this.syncPendingPaymentFromAsaas(payment.asaasChargeId);
+      payment = await this.prisma.payment.findUnique({ where: { id } });
+    }
+
+    return payment;
+  }
+
+  private async syncPendingPaymentFromAsaas(
+    asaasChargeId: string,
+  ): Promise<void> {
+    try {
+      const asaasPayment = await this.asaas.getPayment(asaasChargeId);
+      if (
+        asaasPayment.status === 'CONFIRMED' ||
+        asaasPayment.status === 'RECEIVED'
+      ) {
+        await this.applyPaymentConfirmation(asaasPayment);
+      }
+    } catch (err) {
+      this.logger.warn(
+        `Could not sync pending payment ${asaasChargeId} from Asaas: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
   }
 }

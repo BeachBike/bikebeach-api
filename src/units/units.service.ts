@@ -4,7 +4,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { BikeStatus, Prisma } from '@prisma/client';
+import { BikeStatus, Prisma, Role } from '@prisma/client';
 import { assertCanAccessUnit, isGlobalAdmin } from '../common/tenancy';
 import type { AuthenticatedUser } from '../common/types/authenticated-user.type';
 import { PrismaService } from '../prisma/prisma.service';
@@ -83,5 +83,38 @@ export class UnitsService {
       where: { id },
       data: { isActive: false },
     });
+  }
+
+  /// Public — top-N active instructors of the unit, ordered by createdAt asc
+  /// (longest tenure first). Returns only the public-safe fields used on
+  /// the home page card. Hides email, role, status etc. (D2 / item 2).
+  ///
+  /// 2026-05 — multi-arena: filters via the new `InstructorArena` M2M so
+  /// the same instructor can show up under multiple arenas.
+  async listFeaturedInstructors(unitId: string, limit = 4) {
+    const safeLimit = Math.min(Math.max(1, limit), 12);
+    const rows = await this.prisma.user.findMany({
+      where: {
+        arenaAssignments: { some: { unitId } },
+        role: Role.INSTRUCTOR,
+        isActive: true,
+      },
+      orderBy: { createdAt: 'asc' },
+      take: safeLimit,
+      select: {
+        id: true,
+        name: true,
+        bio: true,
+        primaryClassKind: {
+          select: {
+            id: true,
+            slug: true,
+            name: true,
+            colorToken: true,
+          },
+        },
+      },
+    });
+    return rows;
   }
 }

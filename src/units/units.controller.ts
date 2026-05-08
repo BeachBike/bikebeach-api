@@ -41,6 +41,18 @@ export class UnitsController {
     return this.units.findOne(id);
   }
 
+  /// Public — feeds the home "instrutores" section. Only returns public-safe
+  /// fields (no email/role). `?limit=4` default.
+  @Public()
+  @Get(':id/featured-instructors')
+  featuredInstructors(
+    @Param('id') id: string,
+    @Query('limit') limit?: string,
+  ) {
+    const n = limit ? parseInt(limit, 10) : 4;
+    return this.units.listFeaturedInstructors(id, Number.isFinite(n) ? n : 4);
+  }
+
   @Roles(Role.ADMIN)
   @Patch(':id')
   update(

@@ -1,5 +1,7 @@
 import {
+  IsDateString,
   IsInt,
+  IsOptional,
   IsString,
   Max,
   MaxLength,
@@ -22,4 +24,20 @@ export class CreatePlanDto {
   @IsInt()
   @Min(0)
   priceCents!: number;
+
+  /// C3 — optional time-windowed discount. The 3 fields move together;
+  /// service rejects partial sets.
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  discountPercent?: number;
+
+  @IsOptional()
+  @IsDateString()
+  discountStartsAt?: string;
+
+  @IsOptional()
+  @IsDateString()
+  discountEndsAt?: string;
 }

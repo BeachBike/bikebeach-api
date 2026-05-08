@@ -11,6 +11,7 @@ import {
   Query,
 } from '@nestjs/common';
 import { Role } from '@prisma/client';
+import { Public } from '../common/decorators/public.decorator';
 import { Roles } from '../common/decorators/roles.decorator';
 import { CreatePlanDto } from './dto/create-plan.dto';
 import { UpdatePlanDto } from './dto/update-plan.dto';
@@ -26,11 +27,13 @@ export class PlansController {
     return this.plans.create(dto);
   }
 
+  @Public()
   @Get()
   list(@Query('includeInactive') includeInactive?: string) {
     return this.plans.findAll(includeInactive === 'true');
   }
 
+  @Public()
   @Get(':id')
   findOne(@Param('id') id: string) {
     return this.plans.findOne(id);

@@ -44,7 +44,12 @@ export class WebhooksService {
           await this.payments.applyPaymentConfirmation(payload.payment);
         }
         break;
-      // Other events (PAYMENT_OVERDUE, PAYMENT_REFUNDED, SUBSCRIPTION_DELETED)
+      case 'PAYMENT_OVERDUE':
+        if (payload.payment) {
+          await this.payments.applyPaymentOverdue(payload.payment);
+        }
+        break;
+      // Other events (PAYMENT_REFUNDED, SUBSCRIPTION_DELETED)
       // are logged for observability — wire them when product needs them.
       default:
         this.logger.log(`Ignored Asaas event: ${payload.event}`);

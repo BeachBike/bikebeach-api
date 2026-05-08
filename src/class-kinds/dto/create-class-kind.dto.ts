@@ -1,5 +1,7 @@
+import { ClassKindColor } from '@prisma/client';
 import {
   IsBoolean,
+  IsEnum,
   IsInt,
   IsOptional,
   IsString,
@@ -41,11 +43,12 @@ export class CreateClassKindDto {
   tone?: string;
 
   @IsOptional()
-  @IsBoolean()
-  isActive?: boolean;
+  @IsEnum(ClassKindColor, {
+    message: 'colorToken inválido (use CLAY/SUN/SEA/SAND/INK/GREEN)',
+  })
+  colorToken?: ClassKindColor;
 
   @IsOptional()
-  @IsInt()
-  @Min(0)
-  displayOrder?: number;
+  @IsBoolean()
+  isActive?: boolean;
 }

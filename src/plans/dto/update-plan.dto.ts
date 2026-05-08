@@ -1,5 +1,6 @@
 import {
   IsBoolean,
+  IsDateString,
   IsInt,
   IsOptional,
   IsString,
@@ -30,4 +31,20 @@ export class UpdatePlanDto {
   @IsOptional()
   @IsBoolean()
   isActive?: boolean;
+
+  /// C3 — optional discount. Send the 3 fields together; null/undefined
+  /// for any of them clears the discount when paired with the others.
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  discountPercent?: number | null;
+
+  @IsOptional()
+  @IsDateString()
+  discountStartsAt?: string | null;
+
+  @IsOptional()
+  @IsDateString()
+  discountEndsAt?: string | null;
 }

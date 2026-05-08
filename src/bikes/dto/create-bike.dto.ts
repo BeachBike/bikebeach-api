@@ -2,6 +2,7 @@ import {
   IsInt,
   IsOptional,
   IsString,
+  Matches,
   MaxLength,
   Min,
   MinLength,
@@ -16,15 +17,18 @@ export class CreateBikeDto {
   @MaxLength(40)
   label!: string;
 
+  /// Layout coordinates (B3, 2026-05). Single uppercase letter — A, B, C...
+  /// Optional at create-time so admin can place bikes via the editor later.
   @IsOptional()
-  @IsInt()
-  @Min(0)
-  positionX?: number;
+  @IsString()
+  @Matches(/^[A-Z]$/, { message: 'row deve ser uma única letra maiúscula' })
+  row?: string;
 
+  /// 1-based column index. Must fit within the arena's `maxCols`.
   @IsOptional()
   @IsInt()
-  @Min(0)
-  positionY?: number;
+  @Min(1)
+  col?: number;
 
   @IsOptional()
   @IsString()

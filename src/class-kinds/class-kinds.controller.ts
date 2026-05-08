@@ -48,4 +48,13 @@ export class ClassKindsController {
   async deactivate(@Param('id') id: string): Promise<void> {
     await this.kinds.deactivate(id);
   }
+
+  /// Hard delete with cascade — cancels every SCHEDULED slot of this kind
+  /// and then drops the row. Returns the cancelled count so the admin UI
+  /// can show a confirmation toast (item 16.2).
+  @Roles(Role.ADMIN)
+  @Post(':id/cascade-delete')
+  cascadeDelete(@Param('id') id: string) {
+    return this.kinds.cascadeDelete(id);
+  }
 }

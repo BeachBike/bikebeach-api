@@ -88,13 +88,25 @@ describe('Reservations (e2e)', () => {
       })
     ).id;
 
-    // 4. Instructor (admin creates, then login)
+    // 4. Instructor (admin creates, then login). bio + primaryClassKindId
+    // are mandatory for INSTRUCTOR after C1 — ensure a kind exists first.
+    const testKind = await prisma.classKind.upsert({
+      where: { slug: 'e2e-rsv-kind' },
+      create: {
+        slug: 'e2e-rsv-kind',
+        name: 'RSV Kind',
+        defaultDurationMinutes: 45,
+      },
+      update: {},
+    });
     const instructor = await api('post', '/users/staff', adminToken, {
       email: instructorEmail,
       password: instructorPassword,
       name: 'RSV Instr',
       role: 'INSTRUCTOR',
       unitId,
+      bio: 'RSV bio',
+      primaryClassKindId: testKind.id,
     });
     instructorId = instructor.id;
     instructorToken = (await login(instructorEmail, instructorPassword))
@@ -176,6 +188,9 @@ describe('Reservations (e2e)', () => {
       where: { email: { startsWith: 'e2e-rsv-' } },
     });
     await prisma.unit.deleteMany({
+      where: { slug: { startsWith: 'e2e-rsv-' } },
+    });
+    await prisma.classKind.deleteMany({
       where: { slug: { startsWith: 'e2e-rsv-' } },
     });
   }
@@ -403,18 +418,205 @@ describe('Reservations (e2e)', () => {
     });
 
     it('cancelling someone else\'s reservation returns 403', async () => {
-      // User1 makes a fresh reservation on a free bike for the near slot...
-      // Actually bike2 on slotNear is taken (re-reserved above). Use bike1 on slotNear.
-      const fresh = await request(server)
-        .post('/reservations')
-        .set('Authorization', `Bearer ${user1Token}`)
-        .send({ classSlotId: slotNearId, bikeId: bike1Id })
-        .expect(201);
+      // User1 has the slotNear/bike2 reservation re-booked above and still
+      // ACTIVE. user2 tries to cancel it and gets 403.
+      const list = await api('get', '/reservations/me', user1Token);
+      const target = list.find(
+        (r: { classSlotId: string; status: string }) =>
+          r.classSlotId === slotNearId && r.status === 'ACTIVE',
+      );
+      expect(target).toBeDefined();
 
       await request(server)
-        .delete(`/reservations/${fresh.body.id}`)
+        .delete(`/reservations/${target.id}`)
         .set('Authorization', `Bearer ${user2Token}`)
         .expect(403);
+    });
+  });
+
+  describe('E1 — lead time + double-booking + change-bike', () => {
+    let leadSlotId: string;
+    let bike3Id: string;
+
+    it('blocks reservation inside the 10-min lead window (400)', async () => {
+      // Slot 5 minutes away — backend should reject. We bypass the API to
+      // create it because the create endpoint also enforces validations.
+      const slot = await prisma.classSlot.create({
+        data: {
+          unitId,
+          instructorId,
+          startsAt: new Date(Date.now() + 5 * 60_000),
+          durationMinutes: 50,
+          capacity: 10,
+        },
+      });
+      leadSlotId = slot.id;
+
+      const res = await request(server)
+        .post('/reservations')
+        .set('Authorization', `Bearer ${user1Token}`)
+        .send({ classSlotId: leadSlotId, bikeId: bike1Id })
+        .expect(400);
+      expect(res.body.message).toMatch(/10/);
+    });
+
+    it('blocks a second reservation by the same user on the same slot (409)', async () => {
+      // User1 already has a reservation on slotFarId (bike2 from the
+      // golden-path test earlier). We need a fresh user1 reservation that
+      // we know is ACTIVE — by this point in the suite the earlier far
+      // reservation may have been cancelled, so re-reserve first.
+      const list = await api('get', '/reservations/me', user1Token);
+      const onFarActive = list.find(
+        (r: { classSlotId: string; status: string }) =>
+          r.classSlotId === slotFarId && r.status === 'ACTIVE',
+      );
+      if (!onFarActive) {
+        await api('post', '/reservations', user1Token, {
+          classSlotId: slotFarId,
+          bikeId: bike2Id,
+        });
+      }
+
+      // Need a third bike so we're not asking for the same (slot, bike).
+      bike3Id = (
+        await api('post', '/bikes', adminToken, { unitId, label: 'B3' })
+      ).id;
+
+      const res = await request(server)
+        .post('/reservations')
+        .set('Authorization', `Bearer ${user1Token}`)
+        .send({ classSlotId: slotFarId, bikeId: bike3Id })
+        .expect(409);
+      expect(res.body.message).toMatch(/já tem|trocar bike/i);
+    });
+
+    it('changeBike swaps bike on a far reservation (≥ 8h)', async () => {
+      const list = await api('get', '/reservations/me', user1Token);
+      const onFar = list.find(
+        (r: { classSlotId: string; status: string }) =>
+          r.classSlotId === slotFarId && r.status === 'ACTIVE',
+      );
+      expect(onFar).toBeDefined();
+
+      const res = await request(server)
+        .patch(`/reservations/${onFar.id}/bike`)
+        .set('Authorization', `Bearer ${user1Token}`)
+        .send({ bikeId: bike3Id })
+        .expect(200);
+      expect(res.body.bikeId).toBe(bike3Id);
+      expect(res.body.activeKey).toBe(`${slotFarId}:${bike3Id}`);
+    });
+
+    it('changeBike to the same current bike rejects with 400', async () => {
+      const list = await api('get', '/reservations/me', user1Token);
+      const onFar = list.find(
+        (r: { classSlotId: string; status: string }) =>
+          r.classSlotId === slotFarId && r.status === 'ACTIVE',
+      );
+      const res = await request(server)
+        .patch(`/reservations/${onFar.id}/bike`)
+        .set('Authorization', `Bearer ${user1Token}`)
+        .send({ bikeId: onFar.bikeId })
+        .expect(400);
+      expect(res.body.message).toMatch(/bike atual/i);
+    });
+
+    it('changeBike inside the 8h window rejects with 400', async () => {
+      // Fresh reservation on the near slot (6h away). We cleared bike2 there
+      // earlier and re-booked it; if it's still ACTIVE, change-bike must fail.
+      const list = await api('get', '/reservations/me', user1Token);
+      const onNear = list.find(
+        (r: { classSlotId: string; status: string }) =>
+          r.classSlotId === slotNearId && r.status === 'ACTIVE',
+      );
+      expect(onNear).toBeDefined();
+
+      const res = await request(server)
+        .patch(`/reservations/${onNear.id}/bike`)
+        .set('Authorization', `Bearer ${user1Token}`)
+        .send({ bikeId: bike3Id })
+        .expect(400);
+      expect(res.body.message).toMatch(/8h/);
+    });
+
+    it('changeBike rejects with 403 when caller is not the owner', async () => {
+      const list = await api('get', '/reservations/me', user1Token);
+      const onFar = list.find(
+        (r: { classSlotId: string; status: string }) =>
+          r.classSlotId === slotFarId && r.status === 'ACTIVE',
+      );
+      await request(server)
+        .patch(`/reservations/${onFar.id}/bike`)
+        .set('Authorization', `Bearer ${user2Token}`)
+        .send({ bikeId: bike1Id })
+        .expect(403);
+    });
+
+    it('self-no-show: marca a reserva como NO_SHOW com motivo durante a aula', async () => {
+      // Build a "live" slot — startsAt 5min ago, duration 50min, so we're
+      // currently inside the run window. Create the reservation directly via
+      // Prisma because the create flow rejects past startsAt.
+      const liveSlot = await prisma.classSlot.create({
+        data: {
+          unitId,
+          instructorId,
+          startsAt: new Date(Date.now() - 5 * 60_000),
+          durationMinutes: 50,
+          capacity: 10,
+        },
+      });
+      const liveBike = (
+        await api('post', '/bikes', adminToken, { unitId, label: 'B-LIVE' })
+      ).id;
+      // Need a credit pack to seed the reservation row.
+      const pack = await prisma.creditPack.findFirst({
+        where: { userId: user1Id, remainingCredits: { gt: 0 } },
+      });
+      expect(pack).toBeTruthy();
+      const liveReservation = await prisma.reservation.create({
+        data: {
+          classSlotId: liveSlot.id,
+          bikeId: liveBike,
+          userId: user1Id,
+          creditPackId: pack!.id,
+          status: 'ACTIVE',
+          activeKey: `${liveSlot.id}:${liveBike}`,
+        },
+      });
+
+      // Reason too short → 400
+      await request(server)
+        .post(`/reservations/${liveReservation.id}/self-no-show`)
+        .set('Authorization', `Bearer ${user1Token}`)
+        .send({ reason: 'a' })
+        .expect(400);
+
+      // Owner-mismatch → 403
+      await request(server)
+        .post(`/reservations/${liveReservation.id}/self-no-show`)
+        .set('Authorization', `Bearer ${user2Token}`)
+        .send({ reason: 'tentando me intrometer' })
+        .expect(403);
+
+      // Happy path: status flips to NO_SHOW with the reason recorded.
+      const ok = await request(server)
+        .post(`/reservations/${liveReservation.id}/self-no-show`)
+        .set('Authorization', `Bearer ${user1Token}`)
+        .send({ reason: 'passei mal de manhã, não consegui ir' })
+        .expect(201);
+      expect(ok.body).toMatchObject({
+        id: liveReservation.id,
+        status: 'NO_SHOW',
+        cancellationReason: 'passei mal de manhã, não consegui ir',
+      });
+      expect(ok.body.activeKey).toBeNull();
+
+      // Idempotency check: a second call now hits the "ACTIVE" guard.
+      await request(server)
+        .post(`/reservations/${liveReservation.id}/self-no-show`)
+        .set('Authorization', `Bearer ${user1Token}`)
+        .send({ reason: 'tentando de novo' })
+        .expect(400);
     });
   });
 

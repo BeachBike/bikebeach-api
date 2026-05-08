@@ -1,5 +1,6 @@
 import {
   IsBoolean,
+  IsDateString,
   IsInt,
   IsOptional,
   IsString,
@@ -34,4 +35,20 @@ export class CreatePackOfferDto {
   @IsInt()
   @Min(0)
   displayOrder?: number;
+
+  /// C3 — optional time-windowed discount. Service requires the 3 fields
+  /// to move together.
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  discountPercent?: number;
+
+  @IsOptional()
+  @IsDateString()
+  discountStartsAt?: string;
+
+  @IsOptional()
+  @IsDateString()
+  discountEndsAt?: string;
 }

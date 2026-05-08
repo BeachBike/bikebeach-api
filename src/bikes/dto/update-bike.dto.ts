@@ -4,6 +4,7 @@ import {
   IsInt,
   IsOptional,
   IsString,
+  Matches,
   MaxLength,
   Min,
   MinLength,
@@ -11,6 +12,11 @@ import {
 
 /// `unitId` is intentionally NOT updatable — bikes don't move between units.
 /// Deactivate + recreate at destination unit instead.
+///
+/// `row` and `col` may both be set together (placement) but the API doesn't
+/// support clearing them via PATCH — to take a bike out of service, flip
+/// `status` to OUT_OF_SERVICE; the row/col stay so it can be reactivated in
+/// place. To swap two bikes atomically, use `POST /bikes/:id/swap-with/:other`.
 export class UpdateBikeDto {
   @IsOptional()
   @IsString()
@@ -19,14 +25,14 @@ export class UpdateBikeDto {
   label?: string;
 
   @IsOptional()
-  @IsInt()
-  @Min(0)
-  positionX?: number;
+  @IsString()
+  @Matches(/^[A-Z]$/, { message: 'row deve ser uma única letra maiúscula' })
+  row?: string;
 
   @IsOptional()
   @IsInt()
-  @Min(0)
-  positionY?: number;
+  @Min(1)
+  col?: number;
 
   @IsOptional()
   @IsString()

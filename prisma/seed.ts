@@ -4,7 +4,13 @@ import { hash } from 'bcrypt';
 const BCRYPT_ROUNDS = 12;
 const prisma = new PrismaClient();
 
-const DEFAULT_UNIT_SLUG = 'bc-bombinhas';
+const DEFAULT_UNIT_SLUG = 'bc-central';
+/// Pre-A2 slug. Seed migrates `bc-bombinhas` rows to the new identity in place
+/// so existing dev DBs don't lose admin / packs / reservations on re-seed.
+const LEGACY_UNIT_SLUG = 'bc-bombinhas';
+const DEFAULT_UNIT_NAME = 'BC Central';
+const DEFAULT_UNIT_ADDRESS =
+  'Praia Central — Balneário Camboriú, SC (entre os postos 4 e 5)';
 
 const DEFAULT_PACK_OFFERS = [
   // (classes, priceCents, expirationDays, displayOrder)
@@ -20,13 +26,15 @@ const DEFAULT_PLAN = {
 } as const;
 
 const DEFAULT_CLASS_KINDS = [
-  // (slug, name, defaultDurationMinutes, intensity, tone, displayOrder)
-  { slug: 'sunrise', name: 'Sunrise', defaultDurationMinutes: 45, intensity: 3, tone: 'Despertar enérgico', displayOrder: 1 },
-  { slug: 'sunset', name: 'Sunset', defaultDurationMinutes: 50, intensity: 4, tone: 'Pôr do sol intenso', displayOrder: 2 },
-  { slug: 'power', name: 'Power', defaultDurationMinutes: 50, intensity: 5, tone: 'Força e resistência', displayOrder: 3 },
-  { slug: 'beat-drill', name: 'Beat Drill', defaultDurationMinutes: 45, intensity: 4, tone: 'Coreografia rítmica', displayOrder: 4 },
-  { slug: 'almoco', name: 'Almoço', defaultDurationMinutes: 30, intensity: 2, tone: 'Pausa do meio-dia', displayOrder: 5 },
-  { slug: 'noturno', name: 'Noturno', defaultDurationMinutes: 50, intensity: 4, tone: 'Energia da noite', displayOrder: 6 },
+  // (slug, name, defaultDurationMinutes, intensity, tone, colorToken)
+  // Order is preserved by `createdAt` (ClassKind.displayOrder removed in
+  // 2026-05) — keep this array in the order the admin should see them.
+  { slug: 'sunrise', name: 'Sunrise', defaultDurationMinutes: 45, intensity: 3, tone: 'Despertar enérgico', colorToken: 'SUN' as const },
+  { slug: 'sunset', name: 'Sunset', defaultDurationMinutes: 50, intensity: 4, tone: 'Pôr do sol intenso', colorToken: 'CLAY' as const },
+  { slug: 'power', name: 'Power', defaultDurationMinutes: 50, intensity: 5, tone: 'Força e resistência', colorToken: 'CLAY' as const },
+  { slug: 'beat-drill', name: 'Beat Drill', defaultDurationMinutes: 45, intensity: 4, tone: 'Coreografia rítmica', colorToken: 'SEA' as const },
+  { slug: 'almoco', name: 'Almoço', defaultDurationMinutes: 30, intensity: 2, tone: 'Pausa do meio-dia', colorToken: 'SAND' as const },
+  { slug: 'noturno', name: 'Noturno', defaultDurationMinutes: 50, intensity: 4, tone: 'Energia da noite', colorToken: 'INK' as const },
 ] as const;
 
 async function ensureInitialAdmin() {
@@ -70,18 +78,46 @@ async function ensureInitialAdmin() {
 }
 
 async function ensureDefaultUnit() {
-  const existing = await prisma.unit.findUnique({
+  // Already on the new slug — refresh display fields in case the seed
+  // copy changed.
+  const onNewSlug = await prisma.unit.findUnique({
     where: { slug: DEFAULT_UNIT_SLUG },
   });
-  if (existing) {
-    console.log(`[seed] Default unit already exists: ${DEFAULT_UNIT_SLUG}`);
-    return existing;
+  if (onNewSlug) {
+    return prisma.unit.update({
+      where: { id: onNewSlug.id },
+      data: {
+        name: DEFAULT_UNIT_NAME,
+        address: DEFAULT_UNIT_ADDRESS,
+      },
+    });
   }
+
+  // Migrate the legacy slug in place — preserves admin, bikes, packs, etc.
+  const onLegacy = await prisma.unit.findUnique({
+    where: { slug: LEGACY_UNIT_SLUG },
+  });
+  if (onLegacy) {
+    const migrated = await prisma.unit.update({
+      where: { id: onLegacy.id },
+      data: {
+        slug: DEFAULT_UNIT_SLUG,
+        name: DEFAULT_UNIT_NAME,
+        address: DEFAULT_UNIT_ADDRESS,
+      },
+    });
+    console.log(
+      `[seed] Migrated default unit ${LEGACY_UNIT_SLUG} → ${DEFAULT_UNIT_SLUG}`,
+    );
+    return migrated;
+  }
+
+  // Fresh install.
   const unit = await prisma.unit.create({
     data: {
       slug: DEFAULT_UNIT_SLUG,
-      name: 'BC Bombinhas',
-      address: 'Faixa de areia — Balneário Camboriú / Bombinhas, SC',
+      name: DEFAULT_UNIT_NAME,
+      address: DEFAULT_UNIT_ADDRESS,
     },
   });
   console.log(`[seed] Created default unit: ${unit.slug}`);
@@ -143,6 +179,66 @@ async function main() {
   await ensureDefaultPackOffers(unit.id);
   await ensureDefaultPlan();
   await ensureDefaultClassKinds();
+  await sweepLeakedE2EClassKinds();
+  await backfillInstructorArenas();
+}
+
+/// 2026-05 — backfill the new `InstructorArena` M2M from the legacy
+/// `User.unitId` field for INSTRUCTOR rows. Idempotent: every row has a
+/// composite primary key `(userId, unitId)` so re-runs are no-ops. The
+/// legacy column stays populated so admin scoping (and any old query
+/// that still relies on it) keeps working until that path is rewritten.
+async function backfillInstructorArenas() {
+  const instructors = await prisma.user.findMany({
+    where: { role: Role.INSTRUCTOR, unitId: { not: null } },
+    select: { id: true, unitId: true },
+  });
+  let created = 0;
+  for (const inst of instructors) {
+    if (!inst.unitId) continue;
+    const result = await prisma.instructorArena.upsert({
+      where: {
+        userId_unitId: { userId: inst.id, unitId: inst.unitId },
+      },
+      create: { userId: inst.id, unitId: inst.unitId },
+      update: {},
+    });
+    // `upsert` doesn't tell us "newly created vs existing" — count fresh
+    // rows by comparing timestamps inside the same call would be racy.
+    // Just log the total so the operator sees progress.
+    void result;
+    created++;
+  }
+  if (created > 0) {
+    console.log(
+      `[seed] Ensured InstructorArena rows for ${created} legacy instructor(s)`,
+    );
+  }
+}
+
+/// Idempotent cleanup for ClassKind rows leaked by older e2e specs whose
+/// cleanup() didn't include `prisma.classKind.deleteMany`. Slugs starting
+/// with `e2e-` are reserved for tests; if any survived a run, drop them
+/// here so the admin's tipo-de-aula list stays clean.
+async function sweepLeakedE2EClassKinds() {
+  // Null any FK references first so the delete doesn't break.
+  await prisma.user.updateMany({
+    where: { primaryClassKind: { slug: { startsWith: 'e2e-' } } },
+    data: { primaryClassKindId: null },
+  });
+  await prisma.classSlot.updateMany({
+    where: { classKind: { slug: { startsWith: 'e2e-' } } },
+    data: { classKindId: null },
+  });
+  await prisma.instructorSpecialty.deleteMany({
+    where: { classKind: { slug: { startsWith: 'e2e-' } } },
+  });
+  const dropped = await prisma.classKind.deleteMany({
+    where: { slug: { startsWith: 'e2e-' } },
+  });
+  if (dropped.count > 0) {
+    console.log(`[seed] Swept ${dropped.count} leaked e2e ClassKind row(s)`);
+  }
 }
 
 main()

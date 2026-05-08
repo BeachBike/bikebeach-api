@@ -38,7 +38,16 @@ export class SubscriptionsService {
     // One ACTIVE subscription per user — Asaas would let you have multiple
     // but for product clarity we enforce single-stream.
     const existingActive = await this.prisma.subscription.findFirst({
-      where: { userId, status: SubscriptionStatus.ACTIVE },
+      where: {
+        userId,
+        status: {
+          in: [
+            SubscriptionStatus.PENDING_PAYMENT,
+            SubscriptionStatus.ACTIVE,
+            SubscriptionStatus.PAST_DUE,
+          ],
+        },
+      },
     });
     if (existingActive) {
       throw new ConflictException('Você já tem uma assinatura ativa');
@@ -68,7 +77,7 @@ export class SubscriptionsService {
         userId,
         planId: plan.id,
         asaasSubscriptionId: asaasSub.id,
-        status: SubscriptionStatus.ACTIVE,
+        status: SubscriptionStatus.PENDING_PAYMENT,
         currentPeriodStart: now,
         currentPeriodEnd: cycleEnd,
       },

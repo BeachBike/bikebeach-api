@@ -22,6 +22,7 @@ describe('Payments — Pix pack purchase (e2e)', () => {
   const mockAsaas = {
     createCustomer: jest.fn(),
     createPayment: jest.fn(),
+    getPayment: jest.fn(),
     getPixQrCode: jest.fn(),
   };
 
@@ -129,6 +130,7 @@ describe('Payments — Pix pack purchase (e2e)', () => {
   beforeEach(() => {
     mockAsaas.createCustomer.mockReset();
     mockAsaas.createPayment.mockReset();
+    mockAsaas.getPayment.mockReset();
     mockAsaas.getPixQrCode.mockReset();
   });
 
@@ -380,6 +382,47 @@ describe('Payments — Pix pack purchase (e2e)', () => {
   });
 
   describe('GET /payments/me', () => {
+    it('GET /payments/:id reconciles a paid Asaas charge when webhook was missed', async () => {
+      const paymentBefore = await prisma.payment.findUnique({
+        where: { asaasChargeId: 'pay_test_2' },
+      });
+      expect(paymentBefore?.status).toBe('PENDING');
+
+      const packsBefore = await prisma.creditPack.count({
+        where: { userId, source: 'PURCHASE_PACK' },
+      });
+
+      mockAsaas.getPayment.mockResolvedValueOnce({
+        id: 'pay_test_2',
+        customer: 'cus_test_1',
+        billingType: 'PIX',
+        status: 'RECEIVED',
+        value: 332.5,
+      });
+
+      const res = await request(server)
+        .get(`/payments/${paymentBefore!.id}`)
+        .set('Authorization', `Bearer ${userToken}`)
+        .expect(200);
+
+      expect(mockAsaas.getPayment).toHaveBeenCalledWith('pay_test_2');
+      expect(res.body.status).toBe('PAID');
+
+      const packsAfterCount = await prisma.creditPack.count({
+        where: { userId, source: 'PURCHASE_PACK' },
+      });
+      expect(packsAfterCount).toBe(packsBefore + 1);
+
+      const packsAfter = await prisma.creditPack.findMany({
+        where: { userId, source: 'PURCHASE_PACK', paymentId: paymentBefore!.id },
+      });
+      expect(packsAfter.length).toBe(1);
+      expect(packsAfter[0]).toMatchObject({
+        totalCredits: 10,
+        remainingCredits: 10,
+      });
+    });
+
     it('lists the user\'s payments newest first', async () => {
       const res = await request(server)
         .get('/payments/me')
