@@ -420,7 +420,17 @@ export class UsersService {
     if (dto.email !== undefined) data.email = dto.email;
     if (dto.phone !== undefined) data.phone = dto.phone === '' ? null : dto.phone;
     if (dto.cpf !== undefined) data.cpf = dto.cpf === '' ? null : dto.cpf;
-    if (dto.birthDate !== undefined) data.birthDate = new Date(dto.birthDate);
+    if (dto.birthDate !== undefined) {
+      // Parse "YYYY-MM-DD" as local date (not UTC). Split and construct
+      // so timezone doesn't shift the day. E.g. "2000-05-15" → May 15, 2000
+      // in the local timezone, not UTC (which would be May 14 in -3).
+      const [year, month, day] = dto.birthDate.split('-');
+      data.birthDate = new Date(
+        parseInt(year),
+        parseInt(month) - 1, // JS months are 0-indexed
+        parseInt(day),
+      );
+    }
     if (Object.keys(data).length === 0) {
       // Nothing to update — short-circuit and return the current snapshot
       // so the client can still refresh local state.

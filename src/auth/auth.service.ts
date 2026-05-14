@@ -67,6 +67,16 @@ export class AuthService {
     }
 
     const passwordHash = await hash(dto.password, BCRYPT_ROUNDS);
+    
+    // Parse birthDate as local date (not UTC) to avoid timezone shift.
+    // "YYYY-MM-DD" → Date object in local timezone.
+    const birthDate = dto.birthDate
+      ? (() => {
+          const [year, month, day] = dto.birthDate.split('-');
+          return new Date(parseInt(year), parseInt(month) - 1, parseInt(day));
+        })()
+      : undefined;
+
     const user = await this.prisma.user.create({
       data: {
         email: dto.email,
@@ -74,7 +84,7 @@ export class AuthService {
         name: dto.name,
         phone: dto.phone,
         cpf: dto.cpf,
-        birthDate: dto.birthDate ? new Date(dto.birthDate) : undefined,
+        birthDate,
         goal: dto.goal,
         fitnessLevel: dto.fitnessLevel,
         role: Role.USER,
