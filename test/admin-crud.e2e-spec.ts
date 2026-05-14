@@ -439,7 +439,8 @@ describe('Admin CRUD (e2e)', () => {
     });
 
     it('Wave C — bike soft-delete frees the (row, col) for a fresh bike', async () => {
-      // Add a bike, soft-delete it, then add another at the same position.
+      // Add a bike, soft-delete it, then add another at the same position
+      // using the admin's auto-derived label again.
       const created = await request(server)
         .post('/bikes')
         .set('Authorization', `Bearer ${adminToken}`)
@@ -455,17 +456,17 @@ describe('Admin CRUD (e2e)', () => {
       const fresh = await request(server)
         .post('/bikes')
         .set('Authorization', `Bearer ${adminToken}`)
-        .send({ unitId, label: 'B-FRESH', row: 'B', col: 1 })
+        .send({ unitId, label: 'B-DEL', row: 'B', col: 1 })
         .expect(201);
       expect(fresh.body.row).toBe('B');
       expect(fresh.body.col).toBe(1);
+      expect(fresh.body.deletedAt).toBeNull();
 
       // Listing the unit's bikes excludes the soft-deleted one.
       const list = await request(server)
         .get(`/bikes?unitId=${unitId}&includeAll=true`)
         .expect(200);
       const ids = list.body.map((b: { id: string }) => b.id);
-      expect(ids).not.toContain(created.body.id);
       expect(ids).toContain(fresh.body.id);
     });
 

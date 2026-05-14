@@ -30,6 +30,25 @@ export class BikesService {
     }
 
     try {
+      const deletedWithSameLabel = await this.prisma.bike.findFirst({
+        where: {
+          unitId: dto.unitId,
+          label: dto.label,
+          deletedAt: { not: null },
+        },
+      });
+
+      if (deletedWithSameLabel) {
+        return await this.prisma.bike.update({
+          where: { id: deletedWithSameLabel.id },
+          data: {
+            ...dto,
+            deletedAt: null,
+            status: BikeStatus.OPERATIONAL,
+          },
+        });
+      }
+
       return await this.prisma.bike.create({ data: dto });
     } catch (err) {
       if (
