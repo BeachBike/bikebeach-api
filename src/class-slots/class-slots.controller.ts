@@ -36,14 +36,11 @@ export class ClassSlotsController {
   @Public()
   @Get()
   list(
-    @Query('unitId') unitId: string,
+    @Query('unitId') unitId?: string,
     @Query('from') from?: string,
     @Query('to') to?: string,
     @Query('status') status?: string,
   ) {
-    if (!unitId) {
-      throw new BadRequestException('unitId é obrigatório');
-    }
     let parsedStatus: ClassSlotStatus | undefined;
     if (status) {
       if (!(status in ClassSlotStatus)) {
@@ -51,7 +48,14 @@ export class ClassSlotsController {
       }
       parsedStatus = status as ClassSlotStatus;
     }
-    return this.slots.list({ unitId, from, to, status: parsedStatus });
+    // Empty string from a client that always serializes the param is treated
+    // as "no filter" — same effect as omitting the param entirely.
+    return this.slots.list({
+      unitId: unitId || undefined,
+      from,
+      to,
+      status: parsedStatus,
+    });
   }
 
   @Public()

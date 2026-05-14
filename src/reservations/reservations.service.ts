@@ -116,11 +116,22 @@ export class ReservationsService {
     // 5. Pick the credit pack expiring soonest with credits available.
     //    The atomic decrement inside the transaction guarantees safety even
     //    if the pack's state changes between this read and the write.
+    //    2026-05 — also accepts packs the user co-owns (the buyer added
+    //    them as a friend on a shared pack). Both pools count.
     const candidatePack = await this.prisma.creditPack.findFirst({
       where: {
-        userId: user.id,
-        remainingCredits: { gt: 0 },
-        OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }],
+        AND: [
+          {
+            OR: [
+              { userId: user.id },
+              { coOwners: { some: { userId: user.id } } },
+            ],
+          },
+          { remainingCredits: { gt: 0 } },
+          {
+            OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }],
+          },
+        ],
       },
       orderBy: { expiresAt: 'asc' },
     });
@@ -234,6 +245,21 @@ export class ReservationsService {
             expiresAt: new Date(
               Date.now() + REFUND_PACK_VALIDITY_DAYS * 86_400_000,
             ),
+          },
+        });
+      }
+
+      // 2026-05 — when the cancelled reservation was a waitlist promotion,
+      // the corresponding WaitlistEntry has `promotedAt` set and would
+      // block any rejoin attempt because of the
+      // `@@unique([classSlotId, userId])` constraint. Hard-delete it so
+      // the user can re-queue if they change their mind. The credit was
+      // already refunded above (or kept by the user inside the 8h window).
+      if (reservation.promotedFromWaitlist) {
+        await tx.waitlistEntry.deleteMany({
+          where: {
+            classSlotId: reservation.classSlotId,
+            userId: reservation.userId,
           },
         });
       }

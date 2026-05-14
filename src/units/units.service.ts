@@ -105,6 +105,7 @@ export class UnitsService {
         id: true,
         name: true,
         bio: true,
+        photoUrl: true,
         primaryClassKind: {
           select: {
             id: true,
@@ -116,5 +117,34 @@ export class UnitsService {
       },
     });
     return rows;
+  }
+
+  /// Variant that aggregates across every active arena. Drives the
+  /// "todas as arenas" mode of the global picker on the home page.
+  async listFeaturedInstructorsAcrossArenas(limit = 4) {
+    const safeLimit = Math.min(Math.max(1, limit), 12);
+    return this.prisma.user.findMany({
+      where: {
+        arenaAssignments: { some: { unit: { isActive: true } } },
+        role: Role.INSTRUCTOR,
+        isActive: true,
+      },
+      orderBy: { createdAt: 'asc' },
+      take: safeLimit,
+      select: {
+        id: true,
+        name: true,
+        bio: true,
+        photoUrl: true,
+        primaryClassKind: {
+          select: {
+            id: true,
+            slug: true,
+            name: true,
+            colorToken: true,
+          },
+        },
+      },
+    });
   }
 }

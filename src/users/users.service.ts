@@ -1,15 +1,39 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
 import { Prisma, Role } from '@prisma/client';
 import { hash } from 'bcrypt';
+import { promises as fs } from 'fs';
+import { join } from 'path';
+import type { AuthenticatedUser } from '../common/types/authenticated-user.type';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateStaffUserDto } from './dto/create-staff-user.dto';
 import { UpdateMeDto } from './dto/update-me.dto';
 import { UpdateStaffUserDto } from './dto/update-staff-user.dto';
+
+/// Disk layout mirrors what's served as static under `/uploads/instructors/`
+/// in `main.ts`. We write `<userId>.png` so re-upload overwrites the previous
+/// file and there's nothing to garbage-collect when a different file extension
+/// is uploaded. PNG only — frontend produces a transparent PNG via
+/// `@imgly/background-removal` before sending.
+const INSTRUCTOR_PHOTOS_DIR = join(process.cwd(), 'uploads', 'instructors');
+const INSTRUCTOR_PHOTO_PUBLIC_PREFIX = '/uploads/instructors';
+/// 8MB matches the controller's multer limit. Transparent PNGs from
+/// `@imgly/background-removal` are bigger than typical JPGs because they
+/// carry an alpha channel and use lossless compression.
+const MAX_PHOTO_BYTES = 8 * 1024 * 1024;
+/// Mimetypes the instructor photo upload accepts. PNG is the recommended
+/// path (transparent background, blends with the gradient frame). JPEG is a
+/// fallback for admins who already removed the background elsewhere or are
+/// fine with the rectangular look — frontend warns about the visual impact.
+const MIME_TO_EXT: Record<string, string> = {
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+};
 
 const BCRYPT_ROUNDS = 12;
 
@@ -22,6 +46,7 @@ const STAFF_SELECT = {
   isActive: true,
   mustChangePassword: true,
   bio: true,
+  photoUrl: true,
   primaryClassKindId: true,
   createdAt: true,
   primaryClassKind: {
@@ -422,6 +447,95 @@ export class UsersService {
     return this.findById(userId);
   }
 
+  /// Upload (or replace) the instructor portrait. Accepts PNG (transparent,
+  /// from `@imgly/background-removal`) or JPEG (raw photo, won't blend with
+  /// the gradient frame — admin is warned in the UI). Saved as
+  /// `uploads/instructors/<userId>.<ext>`; any previous file (other ext)
+  /// is removed first so we don't leak orphans on format swap.
+  async setPhoto(
+    targetUserId: string,
+    file: { buffer: Buffer; mimetype: string; size: number },
+    actor: AuthenticatedUser,
+  ) {
+    this.assertCanEditPhoto(targetUserId, actor);
+    if (!file || !file.buffer) {
+      throw new BadRequestException('Arquivo não enviado');
+    }
+    if (file.size > MAX_PHOTO_BYTES) {
+      throw new BadRequestException('Imagem maior que 8MB');
+    }
+    const ext = MIME_TO_EXT[file.mimetype];
+    if (!ext) {
+      throw new BadRequestException(
+        'Imagem precisa ser PNG ou JPG.',
+      );
+    }
+    const target = await this.prisma.user.findUnique({
+      where: { id: targetUserId },
+      select: { id: true, role: true },
+    });
+    if (!target) throw new NotFoundException('Usuário não encontrado');
+    if (target.role !== Role.INSTRUCTOR && target.role !== Role.ADMIN) {
+      throw new BadRequestException('Apenas staff pode ter foto de perfil');
+    }
+
+    await fs.mkdir(INSTRUCTOR_PHOTOS_DIR, { recursive: true });
+    // Drop every previous variant (png/jpg/jpeg) so swapping format doesn't
+    // leave a stale file under another extension.
+    await this.removeInstructorPhotoFiles(targetUserId);
+    const filename = `${targetUserId}.${ext}`;
+    const fullPath = join(INSTRUCTOR_PHOTOS_DIR, filename);
+    await fs.writeFile(fullPath, file.buffer);
+
+    // Cache-bust: append the mtime so the frontend doesn't show a stale image
+    // after re-upload. The static handler ignores the query string.
+    const cacheBust = Date.now();
+    const photoUrl = `${INSTRUCTOR_PHOTO_PUBLIC_PREFIX}/${filename}?v=${cacheBust}`;
+
+    return this.prisma.user.update({
+      where: { id: targetUserId },
+      data: { photoUrl },
+      select: STAFF_SELECT,
+    }).then(flattenSpecialties);
+  }
+
+  async clearPhoto(targetUserId: string, actor: AuthenticatedUser) {
+    this.assertCanEditPhoto(targetUserId, actor);
+    const target = await this.prisma.user.findUnique({
+      where: { id: targetUserId },
+      select: { id: true, photoUrl: true },
+    });
+    if (!target) throw new NotFoundException('Usuário não encontrado');
+    if (target.photoUrl) {
+      await this.removeInstructorPhotoFiles(targetUserId);
+    }
+    return this.prisma.user.update({
+      where: { id: targetUserId },
+      data: { photoUrl: null },
+      select: STAFF_SELECT,
+    }).then(flattenSpecialties);
+  }
+
+  /// Best-effort delete of every variant we might have written (png/jpg).
+  /// We don't track the saved extension separately — it's encoded in
+  /// `photoUrl` but cheaper to just attempt every known one.
+  private async removeInstructorPhotoFiles(userId: string) {
+    await Promise.all(
+      Object.values(MIME_TO_EXT).map((ext) =>
+        fs
+          .unlink(join(INSTRUCTOR_PHOTOS_DIR, `${userId}.${ext}`))
+          .catch(() => undefined),
+      ),
+    );
+  }
+
+  /// ADMIN can edit anyone's photo; INSTRUCTOR can edit only their own.
+  private assertCanEditPhoto(targetUserId: string, actor: AuthenticatedUser) {
+    if (actor.role === Role.ADMIN) return;
+    if (actor.role === Role.INSTRUCTOR && actor.id === targetUserId) return;
+    throw new ForbiddenException('Sem permissão para editar essa foto');
+  }
+
   async findById(id: string) {
     const user = await this.prisma.user.findUnique({
       where: { id },
@@ -439,6 +553,7 @@ export class UsersService {
         isActive: true,
         mustChangePassword: true,
         bio: true,
+        photoUrl: true,
         primaryClassKindId: true,
         hideReservationsFromFriends: true,
         createdAt: true,

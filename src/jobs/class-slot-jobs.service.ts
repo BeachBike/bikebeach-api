@@ -7,6 +7,7 @@ import {
 } from '@prisma/client';
 import { ClassSlotsService } from '../class-slots/class-slots.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { WaitlistService } from '../waitlist/waitlist.service';
 
 /// Tolerance window for the "auto-cancel zero-attendance" job. We mark
 /// slots as cancelled-baixa-adesao when the start time has passed AND
@@ -43,6 +44,7 @@ export class ClassSlotJobsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly classSlots: ClassSlotsService,
+    private readonly waitlist: WaitlistService,
   ) {}
 
   @Cron(CronExpression.EVERY_MINUTE, { name: 'class-slot-tick' })
@@ -61,9 +63,45 @@ export class ClassSlotJobsService {
       this.logger.error('autoConfirmStart failed', err);
     }
     try {
+      await this.refundExpiredWaitlists();
+    } catch (err) {
+      this.logger.error('refundExpiredWaitlists failed', err);
+    }
+    try {
       await this.markCompleted();
     } catch (err) {
       this.logger.error('markCompleted failed', err);
+    }
+  }
+
+  /// Once a slot has reached `startsAt`, anyone still on the waitlist
+  /// will not be promoted (the slot is closed for new entries). Refund
+  /// each pending entry's held credit and mark them removed/refunded.
+  /// Idempotent — re-running picks up no rows.
+  async refundExpiredWaitlists() {
+    const now = new Date();
+    const expired = await this.prisma.classSlot.findMany({
+      where: {
+        startsAt: { lte: now },
+        waitlistEntries: {
+          some: { promotedAt: null, removedAt: null },
+        },
+      },
+      select: { id: true },
+    });
+    for (const slot of expired) {
+      try {
+        const refunded = await this.waitlist.refundUnpromotedAtStart(slot.id);
+        if (refunded > 0) {
+          this.logger.log(
+            `refunded ${refunded} waitlist credit(s) on expired slot ${slot.id}`,
+          );
+        }
+      } catch (err) {
+        this.logger.warn(
+          `waitlist refund skipped slot ${slot.id}: ${(err as Error).message}`,
+        );
+      }
     }
   }
 

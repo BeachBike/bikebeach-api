@@ -52,7 +52,6 @@ export class PaymentsService {
   ): Promise<CreatePixPackResult> {
     const offer = await this.prisma.packOffer.findUnique({
       where: { id: packOfferId },
-      include: { unit: true },
     });
     if (!offer || !offer.isActive) {
       throw new BadRequestException({
@@ -221,6 +220,12 @@ export class PaymentsService {
         // Snapshot taken at purchase — defaults to 30 days for any historical
         // row that pre-dates the column.
         const validityDays = local.packExpirationDays ?? 30;
+        // Snapshot the share/transfer flags from the matching offer (by
+        // `classes`). Falls back to defaults when the offer was deleted
+        // between purchase and webhook delivery.
+        const offer = await tx.packOffer.findUnique({
+          where: { classes: local.packCredits },
+        });
         await tx.creditPack.create({
           data: {
             userId: local.userId,
@@ -231,6 +236,8 @@ export class PaymentsService {
             expiresAt: new Date(
               Date.now() + validityDays * 86_400_000,
             ),
+            isTransferable: offer?.isTransferable ?? false,
+            maxSharedUsers: offer?.maxSharedUsers ?? 0,
           },
         });
       } else if (

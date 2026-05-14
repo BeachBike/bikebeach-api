@@ -2,13 +2,20 @@ import {
   BadRequestException,
   Body,
   Controller,
+  Delete,
   Get,
+  HttpCode,
+  HttpStatus,
   Param,
   Patch,
   Post,
   Query,
+  UploadedFile,
+  UseInterceptors,
 } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
 import { Role } from '@prisma/client';
+import { memoryStorage } from 'multer';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { Roles } from '../common/decorators/roles.decorator';
 import type { AuthenticatedUser } from '../common/types/authenticated-user.type';
@@ -62,5 +69,49 @@ export class UsersController {
   @Patch('staff/:id')
   updateStaff(@Param('id') id: string, @Body() dto: UpdateStaffUserDto) {
     return this.users.updateStaff(id, dto);
+  }
+
+  /// Multipart upload — replaces the staff member's portrait. ADMIN can edit
+  /// anyone; INSTRUCTOR can edit only their own (enforced in the service).
+  /// Accepts PNG (transparent, after `@imgly/background-removal`) or JPG
+  /// (raw photo — admin gets warned about the visual impact). 8MB cap.
+  /// Multer maps the `LIMIT_FILE_SIZE` error to HTTP 413.
+  @Roles(Role.ADMIN, Role.INSTRUCTOR)
+  @Post('staff/:id/photo')
+  @UseInterceptors(
+    FileInterceptor('photo', {
+      storage: memoryStorage(),
+      limits: { fileSize: 8 * 1024 * 1024 },
+      fileFilter: (_req, file, cb) => {
+        if (
+          file.mimetype === 'image/png' ||
+          file.mimetype === 'image/jpeg'
+        ) {
+          cb(null, true);
+        } else {
+          cb(new BadRequestException('Imagem precisa ser PNG ou JPG.'), false);
+        }
+      },
+    }),
+  )
+  uploadPhoto(
+    @Param('id') id: string,
+    @UploadedFile() file: Express.Multer.File | undefined,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    if (!file) {
+      throw new BadRequestException('Campo "photo" obrigatório');
+    }
+    return this.users.setPhoto(id, file, user);
+  }
+
+  @Roles(Role.ADMIN, Role.INSTRUCTOR)
+  @Delete('staff/:id/photo')
+  @HttpCode(HttpStatus.OK)
+  deletePhoto(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.users.clearPhoto(id, user);
   }
 }

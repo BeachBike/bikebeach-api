@@ -7,8 +7,8 @@ import {
   Min,
 } from 'class-validator';
 
-/// `unitId` and `classes` aren't updatable — admin deletes/recreates if they
-/// need to change either. Lets the (unitId, classes) UNIQUE stay meaningful.
+/// `classes` is not updatable — admin deletes/recreates if they need to
+/// change it. Keeps the global UNIQUE(classes) constraint meaningful.
 export class UpdatePackOfferDto {
   @IsOptional()
   @IsInt()
@@ -29,6 +29,16 @@ export class UpdatePackOfferDto {
   @IsInt()
   @Min(0)
   displayOrder?: number;
+
+  @IsOptional()
+  @IsBoolean()
+  isTransferable?: boolean;
+
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  @Max(10)
+  maxSharedUsers?: number;
 
   /// C3 — discount fields. Send the 3 together; null clears the campaign.
   @IsOptional()

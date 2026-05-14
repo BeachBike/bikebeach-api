@@ -27,7 +27,9 @@ import { CreateClassSlotDto } from './dto/create-class-slot.dto';
 import { UpdateClassSlotDto } from './dto/update-class-slot.dto';
 
 interface ListFilter {
-  unitId: string;
+  /// Optional — when omitted, returns slots from every active unit
+  /// (multi-arena home / dashboard with "todas as arenas" selected).
+  unitId?: string;
   from?: string;
   to?: string;
   status?: ClassSlotStatus;
@@ -159,14 +161,21 @@ export class ClassSlotsService {
 
     const slots = await this.prisma.classSlot.findMany({
       where: {
-        unitId: filter.unitId,
+        // When unitId is omitted, only restrict by active arenas. We don't want
+        // slots leaking from soft-deleted units when the caller asked for "all".
+        ...(filter.unitId
+          ? { unitId: filter.unitId }
+          : { unit: { isActive: true } }),
         startsAt:
           Object.keys(startsAtFilter).length > 0 ? startsAtFilter : undefined,
         status: filter.status,
       },
       include: {
         classKind: true,
-        instructor: { select: { id: true, name: true } },
+        instructor: { select: { id: true, name: true, photoUrl: true } },
+        // Surfaces the arena identity so the frontend can render a badge on
+        // each card when the user is viewing "todas as arenas".
+        unit: { select: { id: true, slug: true, name: true } },
         _count: {
           select: {
             reservations: {
@@ -212,7 +221,7 @@ export class ClassSlotsService {
       where: { id },
       include: {
         classKind: true,
-        instructor: { select: { id: true, name: true } },
+        instructor: { select: { id: true, name: true, photoUrl: true } },
       },
     });
     if (!slot) throw new NotFoundException('Aula não encontrada');
@@ -228,10 +237,12 @@ export class ClassSlotsService {
       where: { id },
       include: {
         classKind: true,
-        instructor: { select: { id: true, name: true } },
+        instructor: { select: { id: true, name: true, photoUrl: true } },
         unit: {
           select: {
             id: true,
+            slug: true,
+            name: true,
             maxRows: true,
             maxCols: true,
           },

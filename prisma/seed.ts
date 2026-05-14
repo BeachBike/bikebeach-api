@@ -124,17 +124,23 @@ async function ensureDefaultUnit() {
   return unit;
 }
 
-async function ensureDefaultPackOffers(unitId: string) {
+/// Pack offers are global (2026-05). The `unitId` arg is kept on the
+/// signature so callers don't need to refactor; it's now ignored.
+async function ensureDefaultPackOffers(_unitId: string) {
   for (const offer of DEFAULT_PACK_OFFERS) {
+    const { unitId: _drop, ...rest } = offer as typeof offer & {
+      unitId?: string;
+    };
+    void _drop;
     await prisma.packOffer.upsert({
-      where: { unitId_classes: { unitId, classes: offer.classes } },
-      create: { ...offer, unitId },
+      where: { classes: rest.classes },
+      create: rest,
       // Refresh seed-controlled fields so a re-run picks up canonical price /
       // expiry tweaks. Admin-controlled toggles (`isActive`, `displayOrder`)
       // are intentionally left alone.
       update: {
-        priceCents: offer.priceCents,
-        expirationDays: offer.expirationDays,
+        priceCents: rest.priceCents,
+        expirationDays: rest.expirationDays,
       },
     });
   }

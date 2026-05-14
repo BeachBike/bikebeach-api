@@ -42,7 +42,9 @@ export class UnitsController {
   }
 
   /// Public — feeds the home "instrutores" section. Only returns public-safe
-  /// fields (no email/role). `?limit=4` default.
+  /// fields (no email/role). `?limit=4` default. The literal `id=all` is a
+  /// reserved sentinel: returns top-N across every active arena (drives the
+  /// "todas as arenas" option of the global arena picker on the home).
   @Public()
   @Get(':id/featured-instructors')
   featuredInstructors(
@@ -50,7 +52,11 @@ export class UnitsController {
     @Query('limit') limit?: string,
   ) {
     const n = limit ? parseInt(limit, 10) : 4;
-    return this.units.listFeaturedInstructors(id, Number.isFinite(n) ? n : 4);
+    const safeN = Number.isFinite(n) ? n : 4;
+    if (id === 'all') {
+      return this.units.listFeaturedInstructorsAcrossArenas(safeN);
+    }
+    return this.units.listFeaturedInstructors(id, safeN);
   }
 
   @Roles(Role.ADMIN)

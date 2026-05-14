@@ -25,13 +25,12 @@ export class PackOffersController {
   constructor(private readonly offers: PackOffersService) {}
 
   /// Public: customer-facing /planos page (only active offers).
+  /// `unitId` opcional — sem ele lista pacotes de todas as arenas ativas
+  /// (modo "todas as arenas" do seletor global).
   @Public()
   @Get()
-  list(@Query('unitId') unitId: string) {
-    if (!unitId) {
-      throw new BadRequestException('unitId é obrigatório');
-    }
-    return this.offers.listPublic(unitId);
+  list(@Query('unitId') unitId?: string) {
+    return this.offers.listPublic(unitId || undefined);
   }
 
   /// Admin: includes inactive so admin can edit / re-enable.

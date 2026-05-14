@@ -3,16 +3,13 @@ import {
   IsDateString,
   IsInt,
   IsOptional,
-  IsString,
   Max,
   Min,
 } from 'class-validator';
 
 export class CreatePackOfferDto {
-  @IsString()
-  unitId!: string;
-
-  /// Number of credits in the pack. Unique per unit (admin "edits" by PATCH).
+  /// Number of credits in the pack — globally unique. Admin "edits" by
+  /// PATCHing the row instead of creating a duplicate.
   @IsInt()
   @Min(1)
   @Max(200)
@@ -35,6 +32,20 @@ export class CreatePackOfferDto {
   @IsInt()
   @Min(0)
   displayOrder?: number;
+
+  /// 2026-05 — when true, buyers can transfer N credits from the resulting
+  /// CreditPack to a friend. Only admin-marked packs expose the option.
+  @IsOptional()
+  @IsBoolean()
+  isTransferable?: boolean;
+
+  /// 2026-05 — max friends that can co-own the resulting CreditPack
+  /// alongside the buyer. 0 disables sharing. Cap at 10 to avoid abuse.
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  @Max(10)
+  maxSharedUsers?: number;
 
   /// C3 — optional time-windowed discount. Service requires the 3 fields
   /// to move together.

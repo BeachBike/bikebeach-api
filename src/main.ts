@@ -1,10 +1,24 @@
 import { ValidationPipe } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { NestFactory } from '@nestjs/core';
+import { NestExpressApplication } from '@nestjs/platform-express';
+import { join } from 'path';
 import { AppModule } from './app.module';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  const app = await NestFactory.create<NestExpressApplication>(AppModule);
+
+  // Default Nest body-parser limits are 100kb — too tight for some legitimate
+  // payloads (e.g. seed data, future bulk endpoints). Multipart is handled
+  // separately by multer (in the controllers that use FileInterceptor), so
+  // this only relaxes JSON / urlencoded paths.
+  app.useBodyParser('json', { limit: '5mb' });
+  app.useBodyParser('urlencoded', { limit: '5mb', extended: true });
+
+  // Static files for user-uploaded assets (instructor portraits at the moment).
+  // Served under `/uploads/...` so the frontend can reference
+  // `${API_BASE}/uploads/instructors/<userId>.png` directly.
+  app.useStaticAssets(join(process.cwd(), 'uploads'), { prefix: '/uploads' });
 
   app.useGlobalPipes(
     new ValidationPipe({

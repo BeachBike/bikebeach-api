@@ -79,6 +79,9 @@ enum CreditSource {
   SUBSCRIPTION_CYCLE
   ADMIN_GRANT
   REFUND
+  /// 2026-05 — credits sent from another user via the "transfer to friend"
+  /// flow. The new pack inherits the original pack's expiry.
+  TRANSFER
 }
 
 enum SubscriptionStatus {
@@ -173,7 +176,6 @@ model Unit {
   staff      User[]
   bikes      Bike[]
   classSlots ClassSlot[]
-  packOffers PackOffer[]
   /// Inverse of `InstructorArena.unit` — instructors who can teach here.
   /// Driven by the M2M table; `staff` (single-side) stays for ADMIN role.
   instructorAssignments InstructorArena[] @relation("ArenaInstructors")
@@ -211,6 +213,11 @@ model User {
   /// Free-text bio shown on instructor profile (admin-managed). Required
   /// for INSTRUCTOR role — enforced at service layer.
   bio                String?
+  /// Relative path to the instructor's portrait, served as static asset
+  /// from the API (`/uploads/instructors/<userId>.png`). PNG with
+  /// transparent background — produced client-side via
+  /// `@imgly/background-removal` before upload. Null = render placeholder.
+  photoUrl           String?
   /// Carro-chefe — the instructor's signature ClassKind. Drives the avatar
   /// tint on cards and the home-page hero. Always one of their
   /// `instructorSpecialties`. Added in C1 (2026-05).
@@ -240,6 +247,9 @@ model User {
   cancelledReservations Reservation[]         @relation("ReservationCancelledBy")
   waitlistEntries       WaitlistEntry[]
   creditPacks           CreditPack[]
+  /// 2026-05 — packs the user co-owns (was added as a friend by the
+  /// buyer). The buyer's own packs are listed via `creditPacks` above.
+  creditPackCoOwnerships CreditPackCoOwner[]
   subscriptions         Subscription[]
   payments              Payment[]
   loggedBikeMaintenance BikeMaintenance[]     @relation("BikeMaintenanceLogger")
@@ -443,14 +453,19 @@ model ClassKind {
   primaryForInstructors User[]                @relation("PrimaryClassKind")
 }
 
-/// Per-unit pricing offer for one-off credit packs. Replaces the old
+/// Pricing offer for one-off credit packs. Replaces the old
 /// PACK_PRICING_CENTS constant — admin can tune from the dashboard.
+///
+/// 2026-05 — packs are GLOBAL across every arena. The legacy `unitId`
+/// column was dropped: there is one source of truth per `classes` count.
+/// 2026-05 — `isTransferable` and `maxSharedUsers` open the gate for
+/// resulting CreditPacks to be transfered (credit-by-credit) or shared
+/// (co-owned by friends). Both default off.
 model PackOffer {
   id             String   @id @default(cuid())
-  unitId         String
-  unit           Unit     @relation(fields: [unitId], references: [id])
-  /// Number of credits in this pack (1 = avulso, 10 / 20 = packs).
-  classes        Int
+  /// Number of credits in this pack (1 = avulso, 10 / 20 = packs). Unique
+  /// globally — admin "edits" by patching the row.
+  classes        Int      @unique
   priceCents     Int
   /// Days after purchase that the resulting CreditPack expires.
   expirationDays Int
@@ -464,13 +479,18 @@ model PackOffer {
   discountPercent   Int?
   discountStartsAt  DateTime?
   discountEndsAt    DateTime?
+  /// 2026-05 — when true, buyers can transfer N credits from the resulting
+  /// CreditPack to a friend (creates a new CreditPack on their side with
+  /// the same expiry).
+  isTransferable    Boolean  @default(false)
+  /// 2026-05 — when > 0, buyers can pick up to N friends to co-own the
+  /// resulting CreditPack. Co-owners share a single credit pool. 0 means
+  /// "not shareable".
+  maxSharedUsers    Int      @default(0)
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 
-  /// Only one active offer per (unit, classes) — admin "edits" by patching the
-  /// row, not by creating a duplicate.
-  @@unique([unitId, classes])
-  @@index([unitId, isActive])
+  @@index([isActive])
 }
 
 /// A scheduled class — one instructor, a starts-at, a duration, a capacity.
@@ -580,10 +600,23 @@ model WaitlistEntry {
   promotedAt  DateTime?
   removedAt   DateTime?
 
+  /// 2026-05 — joining the waitlist consumes 1 credit upfront. We track
+  /// which pack the credit came from so we can refund the exact bucket
+  /// when the user leaves the queue, when the studio cancels the slot,
+  /// or when the slot starts without promoting this entry. `null` for
+  /// legacy rows created before this rule (pre-migration data).
+  creditPackId String?
+  creditPack   CreditPack? @relation(fields: [creditPackId], references: [id])
+  /// When `joinedAt`'s credit decrement was refunded — i.e., the entry
+  /// terminated without a promotion. Mutually exclusive with `promotedAt`
+  /// in practice (a promoted entry inherits the credit consumption).
+  refundedAt   DateTime?
+
   /// One waitlist entry per user per slot. Cancelling a queued entry deletes
   /// the row (or sets removedAt — TBD when we wire 5b).
   @@unique([classSlotId, userId])
   @@index([classSlotId, joinedAt])
+  @@index([creditPackId])
 }
 
 // =============================================================================
@@ -612,7 +645,28 @@ model CreditPack {
   paymentId String?
   payment   Payment? @relation(fields: [paymentId], references: [id])
 
+  /// 2026-05 — snapshot of the PackOffer's transfer/share flags at the
+  /// time this pack was created. Snapshotted (not joined) so an admin
+  /// editing the offer later doesn't retroactively change what an
+  /// already-bought pack is allowed to do.
+  isTransferable Boolean @default(false)
+  /// Max friends that can co-own this pack (already includes the buyer
+  /// implicitly). 0 = sharing disabled. Counted against the live
+  /// `coOwners` set.
+  maxSharedUsers Int     @default(0)
+
   reservations Reservation[]
+  /// 2026-05 — waitlist entries that consumed a credit from this pack
+  /// upfront. We need the inverse relation so cascade behaviour stays
+  /// explicit, and so a service-level audit could surface "X pending
+  /// waitlists are holding Y credits".
+  waitlistEntries WaitlistEntry[]
+  /// 2026-05 — friends that co-own this pack and can also consume from
+  /// the same `remainingCredits` pool. Empty for solo packs. The pack's
+  /// `userId` (the buyer) is NOT mirrored here — they're the implicit
+  /// owner. The atomic `updateMany {remainingCredits: gt 0}` decrement
+  /// trivially handles the concurrency case (last-writer-wins-but-positive).
+  coOwners CreditPackCoOwner[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -620,6 +674,21 @@ model CreditPack {
   /// "Pack with credits left, not expired" lookup is the hot path during reservation.
   @@index([userId, expiresAt])
   @@index([userId, remainingCredits])
+}
+
+/// 2026-05 — Junction for friends that co-own a CreditPack alongside the
+/// buyer. Concurrency: every consumer (buyer or co-owner) hits the same
+/// `CreditPack.remainingCredits` row through the atomic conditional
+/// decrement, so no two reservations can both win the last credit.
+model CreditPackCoOwner {
+  creditPackId String
+  creditPack   CreditPack @relation(fields: [creditPackId], references: [id], onDelete: Cascade)
+  userId       String
+  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  addedAt      DateTime   @default(now())
+
+  @@id([creditPackId, userId])
+  @@index([userId])
 }
 
 /// A purchasable monthly plan (e.g. "Plano 8 aulas — R$ 199/mês").

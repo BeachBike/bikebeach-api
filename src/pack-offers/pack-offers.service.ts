@@ -1,39 +1,45 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
+import { Prisma, Role } from '@prisma/client';
 import { validateDiscountWindow } from '../common/discount';
-import { assertCanAccessUnit } from '../common/tenancy';
 import type { AuthenticatedUser } from '../common/types/authenticated-user.type';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreatePackOfferDto } from './dto/create-pack-offer.dto';
 import { UpdatePackOfferDto } from './dto/update-pack-offer.dto';
 
+/// Pack offers are GLOBAL — there is one source of truth per `classes`
+/// count, regardless of arena. Only ADMIN can mutate. The `isTransferable`
+/// and `maxSharedUsers` flags expose the resulting CreditPack to the
+/// transfer + share flows.
 @Injectable()
 export class PackOffersService {
   constructor(private readonly prisma: PrismaService) {}
 
   async create(dto: CreatePackOfferDto, user: AuthenticatedUser) {
-    assertCanAccessUnit(user, dto.unitId);
-
-    const unit = await this.prisma.unit.findUnique({
-      where: { id: dto.unitId },
-    });
-    if (!unit || !unit.isActive) {
-      throw new BadRequestException('Unidade inválida ou inativa');
+    if (user.role !== Role.ADMIN) {
+      throw new ForbiddenException('Apenas admin pode criar pacote');
     }
 
     const discount = validateDiscountWindow(dto);
     const data: Prisma.PackOfferCreateInput = {
-      unit: { connect: { id: dto.unitId } },
       classes: dto.classes,
       priceCents: dto.priceCents,
       expirationDays: dto.expirationDays,
       ...(dto.isActive !== undefined && { isActive: dto.isActive }),
-      ...(dto.displayOrder !== undefined && { displayOrder: dto.displayOrder }),
+      ...(dto.displayOrder !== undefined && {
+        displayOrder: dto.displayOrder,
+      }),
+      ...(dto.isTransferable !== undefined && {
+        isTransferable: dto.isTransferable,
+      }),
+      ...(dto.maxSharedUsers !== undefined && {
+        maxSharedUsers: Math.max(0, dto.maxSharedUsers),
+      }),
       ...(discount && {
         discountPercent: discount.discountPercent,
         discountStartsAt: discount.discountStartsAt,
@@ -49,27 +55,28 @@ export class PackOffersService {
         err.code === 'P2002'
       ) {
         throw new ConflictException(
-          'Já existe um pacote com esse número de aulas nessa unidade — edite o existente',
+          'Já existe um pacote com esse número de aulas — edite o existente',
         );
       }
       throw err;
     }
   }
 
-  /// Public listing for the customer-facing /planos page. Filters out inactive
-  /// offers; ordered by displayOrder then classes.
-  async listPublic(unitId: string) {
+  /// Public listing for the customer-facing /planos page. Returns active
+  /// offers, ordered by `displayOrder` then `classes`. The `unitId` arg
+  /// is preserved for backward-compat in callers but ignored — packs are
+  /// global as of 2026-05.
+  async listPublic(_unitId?: string) {
     return this.prisma.packOffer.findMany({
-      where: { unitId, isActive: true },
+      where: { isActive: true },
       orderBy: [{ displayOrder: 'asc' }, { classes: 'asc' }],
     });
   }
 
-  /// Admin listing — includes inactive so admin can re-enable.
-  async listForAdmin(unitId: string, user: AuthenticatedUser) {
-    assertCanAccessUnit(user, unitId);
+  /// Admin listing — includes inactive so admin can re-enable. The
+  /// `unitId` arg is also legacy / ignored.
+  async listForAdmin(_unitId: string, _user: AuthenticatedUser) {
     return this.prisma.packOffer.findMany({
-      where: { unitId },
       orderBy: [{ displayOrder: 'asc' }, { classes: 'asc' }],
     });
   }
@@ -82,26 +89,36 @@ export class PackOffersService {
 
   async update(id: string, dto: UpdatePackOfferDto, user: AuthenticatedUser) {
     const existing = await this.findOne(id);
-    assertCanAccessUnit(user, existing.unitId);
+    if (user.role !== Role.ADMIN) {
+      throw new ForbiddenException('Apenas admin pode editar pacote');
+    }
     const discount = validateDiscountWindow(dto);
     const data: Prisma.PackOfferUpdateInput = {};
     if (dto.priceCents !== undefined) data.priceCents = dto.priceCents;
-    if (dto.expirationDays !== undefined) data.expirationDays = dto.expirationDays;
+    if (dto.expirationDays !== undefined)
+      data.expirationDays = dto.expirationDays;
     if (dto.isActive !== undefined) data.isActive = dto.isActive;
     if (dto.displayOrder !== undefined) data.displayOrder = dto.displayOrder;
+    if (dto.isTransferable !== undefined)
+      data.isTransferable = dto.isTransferable;
+    if (dto.maxSharedUsers !== undefined)
+      data.maxSharedUsers = Math.max(0, dto.maxSharedUsers);
     if (discount) {
       data.discountPercent = discount.discountPercent;
       data.discountStartsAt = discount.discountStartsAt;
       data.discountEndsAt = discount.discountEndsAt;
     }
+    void existing;
     return this.prisma.packOffer.update({ where: { id }, data });
   }
 
   async remove(id: string, user: AuthenticatedUser) {
-    const existing = await this.findOne(id);
-    assertCanAccessUnit(user, existing.unitId);
-    // Soft "remove" via deactivate so historical Payment / CreditPack rows that
-    // implicitly reference this offer keep their context.
+    if (user.role !== Role.ADMIN) {
+      throw new ForbiddenException('Apenas admin pode remover pacote');
+    }
+    await this.findOne(id);
+    // Soft "remove" via deactivate so historical Payment / CreditPack rows
+    // that implicitly reference this offer keep their context.
     await this.prisma.packOffer.update({
       where: { id },
       data: { isActive: false },
