@@ -20,6 +20,7 @@ import {
   STANDARD_CANCELLATION_WINDOW_HOURS,
   WAITLIST_PROTECTED_CANCELLATION_WINDOW_HOURS,
 } from '../common/constants';
+import { assertNoOpenCreditDebt } from '../common/credit-debt.guard';
 import { isGlobalAdmin } from '../common/tenancy';
 import type { AuthenticatedUser } from '../common/types/authenticated-user.type';
 import { HealthGateService } from '../health-gate/health-gate.service';
@@ -40,6 +41,12 @@ export class ReservationsService {
   async create(dto: CreateReservationDto, user: AuthenticatedUser) {
     // 1. Health gate (LGPD-sensitive forms must be valid)
     await this.healthGate.assertValid(user.id);
+
+    // 1b. Credit-debt gate. A user with an open CreditDebt (from a prior
+    // refund/chargeback) must settle it before consuming new credits —
+    // 403 CREDIT_DEBT_BLOCK, FE renders a dedicated banner pointing to the
+    // pack purchase flow.
+    await assertNoOpenCreditDebt(this.prisma, user.id);
 
     // 2. Validate class slot
     const slot = await this.prisma.classSlot.findUnique({

@@ -24,7 +24,25 @@ export type AsaasPaymentStatus =
   | 'RECEIVED'
   | 'OVERDUE'
   | 'REFUNDED'
-  | 'AWAITING_RISK_ANALYSIS';
+  /// Card charge accepted but held for manual fraud review.
+  | 'AWAITING_RISK_ANALYSIS'
+  /// Card charge rejected by Asaas anti-fraud after review.
+  | 'REPROVED_BY_RISK_ANALYSIS'
+  /// Refund / chargeback lifecycle — surfaced via webhook events; we keep
+  /// the union complete so the reconciliation sync can narrow safely.
+  | 'REFUND_REQUESTED'
+  | 'REFUND_IN_PROGRESS'
+  | 'CHARGEBACK_REQUESTED'
+  | 'CHARGEBACK_DISPUTE'
+  | 'AWAITING_CHARGEBACK_REVERSAL';
+
+/// Card metadata Asaas echoes back on a CREDIT_CARD / DEBIT_CARD payment.
+/// `creditCardNumber` is the last 4 digits only — never the full PAN.
+export interface AsaasCreditCardInfo {
+  creditCardNumber?: string;
+  creditCardBrand?: string;
+  creditCardToken?: string;
+}
 
 export interface AsaasPayment {
   id: string;
@@ -38,6 +56,10 @@ export interface AsaasPayment {
   dueDate?: string;
   /// Set by Asaas when this Payment is part of a Subscription cycle.
   subscription?: string | null;
+  /// Set on card payments — number of parcelas.
+  installmentCount?: number | null;
+  /// Set on card payments once processed. `creditCardNumber` = last 4.
+  creditCard?: AsaasCreditCardInfo | null;
 }
 
 export type AsaasSubscriptionStatus = 'ACTIVE' | 'EXPIRED' | 'INACTIVE';
@@ -84,6 +106,57 @@ export interface CreatePaymentPayload {
   dueDate: string;
   description?: string;
   externalReference?: string;
+}
+
+/// Raw card data — exists only transiently in memory between the controller
+/// and the Asaas HTTP call. NEVER persisted, NEVER logged (the client
+/// redacts it). `ccv` is the CVV; Asaas does not return it and we never
+/// store it.
+export interface AsaasCreditCard {
+  holderName: string;
+  number: string;
+  expiryMonth: string;
+  expiryYear: string;
+  ccv: string;
+}
+
+/// Cardholder identification — required by Asaas anti-fraud on every
+/// transparent card charge.
+export interface AsaasCreditCardHolderInfo {
+  name: string;
+  email: string;
+  cpfCnpj: string;
+  postalCode: string;
+  addressNumber: string;
+  addressComplement?: string | null;
+  phone: string;
+  mobilePhone?: string;
+}
+
+/// Transparent card charge (credit or debit).
+/// - À vista (`installmentCount` 1 / omitted): send `value` = the amount
+///   the customer pays (already includes any interest we computed locally
+///   — see `computeFinancedTotalCents`).
+/// - Parcelado (`installmentCount` > 1, CREDIT only): send `totalValue` =
+///   financed total and `installmentCount`; Asaas just splits it. We do
+///   NOT rely on the Asaas dashboard "parcelamento com juros" config —
+///   the interest math lives in our service so it's deterministic +
+///   auditable + visible in the UI before submit.
+/// `remoteIp` is the END USER's IP, required by Asaas anti-fraud — capture it
+/// from the request, not the server.
+export interface CreateCardPaymentPayload {
+  customer: string;
+  billingType: 'CREDIT_CARD' | 'DEBIT_CARD';
+  value?: number;
+  totalValue?: number;
+  installmentCount?: number;
+  /// `YYYY-MM-DD`.
+  dueDate: string;
+  description?: string;
+  externalReference?: string;
+  creditCard: AsaasCreditCard;
+  creditCardHolderInfo: AsaasCreditCardHolderInfo;
+  remoteIp: string;
 }
 
 export interface AsaasPixQrCode {

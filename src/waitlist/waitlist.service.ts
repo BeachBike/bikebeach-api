@@ -11,6 +11,7 @@ import {
   Prisma,
   ReservationStatus,
 } from '@prisma/client';
+import { assertNoOpenCreditDebt } from '../common/credit-debt.guard';
 import { assertCanManageSlot } from '../common/tenancy';
 import type { AuthenticatedUser } from '../common/types/authenticated-user.type';
 import { HealthGateService } from '../health-gate/health-gate.service';
@@ -41,6 +42,9 @@ export class WaitlistService {
   async join(slotId: string, user: AuthenticatedUser) {
     // Health gate must be valid — if not, the user couldn't be promoted anyway.
     await this.healthGate.assertValid(user.id);
+    // Credit-debt gate — joining the waitlist consumes a credit upfront, so
+    // a user with an open CreditDebt must settle it before queueing.
+    await assertNoOpenCreditDebt(this.prisma, user.id);
 
     const slot = await this.prisma.classSlot.findUnique({
       where: { id: slotId },

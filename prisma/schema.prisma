@@ -97,6 +97,22 @@ enum PaymentStatus {
   PAID
   FAILED
   REFUNDED
+  /// 2026-05 — the Pix charge passed its due date without being paid (the
+  /// QR code expired). Distinct from FAILED so the UI can offer "gerar
+  /// novo QR" instead of a generic error. Set by the reconciliation cron
+  /// and by the on-demand sync when Asaas reports OVERDUE.
+  EXPIRED
+  /// 2026-05 — card charge accepted by Asaas but held for manual fraud
+  /// review (`AWAITING_RISK_ANALYSIS`). NOT paid yet — no CreditPack is
+  /// minted. The webhook (`PAYMENT_CONFIRMED`) or the reconciliation cron
+  /// resolves it to PAID or FAILED. UI shows "em análise".
+  IN_REVIEW
+}
+
+/// 2026-05 — origin of a CreditDebt row.
+enum CreditDebtReason {
+  REFUND
+  CHARGEBACK
 }
 
 enum PaymentMethod {
@@ -252,6 +268,9 @@ model User {
   creditPackCoOwnerships CreditPackCoOwner[]
   subscriptions         Subscription[]
   payments              Payment[]
+  /// 2026-05 — credit debts owed after a refund/chargeback. While any has
+  /// `remainingCredits > 0` the user can't make new reservations.
+  creditDebts           CreditDebt[]
   loggedBikeMaintenance BikeMaintenance[]     @relation("BikeMaintenanceLogger")
   instructorSpecialties InstructorSpecialty[]
   /// 2026-05 — instructor multi-arena. An INSTRUCTOR can teach at one or
@@ -755,15 +774,68 @@ model Payment {
   packCredits        Int?
   packExpirationDays Int?
 
+  /// 2026-05 — card-payment metadata. NULL for PIX. `installments` is the
+  /// number of parcelas (1 = à vista); the interest, when parcelado, is
+  /// applied by Asaas (dashboard config) and folded into `amountCents`.
+  /// `cardBrand` / `cardLast4` come from the Asaas response — used in the
+  /// receipt and payment history ("crédito •••• 1234"). `failureReason`
+  /// holds the decline reason for FAILED card charges.
+  installments  Int?
+  cardBrand     String?
+  cardLast4     String?
+  failureReason String?
+
   /// The CreditPack created from this Payment (when applicable). Backref of
   /// CreditPack.payment.
   creditPacks CreditPack[]
+
+  /// 2026-05 — debts whose origin is this (refunded / charged-back) Payment.
+  debtsOriginated CreditDebt[] @relation("DebtOrigin")
+  /// 2026-05 — debts that this Payment's CreditPack settled on purchase.
+  debtsSettled    CreditDebt[] @relation("DebtSettlement")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([userId])
   @@index([status])
+}
+
+/// 2026-05 — a credit debt owed by a user. Created when a card Payment is
+/// refunded or charged back AFTER some of its CreditPack credits were already
+/// consumed: the unused credits are zeroed on the pack, the already-consumed
+/// ones become this debt. The debt never expires. It is settled by the next
+/// pack purchase — `applyPaymentConfirmation` deducts `remainingCredits` here
+/// from the freshly-minted pack before crediting the user. While any debt has
+/// `remainingCredits > 0` the user is blocked from new reservations (structured
+/// 403, same pattern as the health gate).
+model CreditDebt {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id])
+
+  reason CreditDebtReason
+
+  /// Credits originally owed vs still outstanding. `remainingCredits` hits 0
+  /// when fully settled; `settledAt` is stamped at that moment.
+  amountCredits    Int
+  remainingCredits Int
+
+  /// The refunded / charged-back Payment that produced this debt.
+  originPaymentId String
+  originPayment   Payment @relation("DebtOrigin", fields: [originPaymentId], references: [id])
+
+  /// The Payment whose pack purchase settled this debt (set once, when the
+  /// debt first reaches remainingCredits = 0).
+  settledByPaymentId String?
+  settledByPayment   Payment? @relation("DebtSettlement", fields: [settledByPaymentId], references: [id])
+  settledAt          DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// Hot path: "does this user have an open debt?" gate on reservation.
+  @@index([userId, remainingCredits])
 }
 
 // =============================================================================

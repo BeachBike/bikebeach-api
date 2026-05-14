@@ -4,6 +4,7 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { CreditDebtReason } from '@prisma/client';
 import type { AsaasWebhookPayload } from '../asaas/asaas-client.types';
 import { PaymentsService } from '../payments/payments.service';
 
@@ -49,8 +50,35 @@ export class WebhooksService {
           await this.payments.applyPaymentOverdue(payload.payment);
         }
         break;
-      // Other events (PAYMENT_REFUNDED, SUBSCRIPTION_DELETED)
-      // are logged for observability — wire them when product needs them.
+      // Refund — admin-initiated or Asaas-initiated. Clawback policy is in
+      // applyPaymentRefund: unused credits zeroed, consumed credits become
+      // a CreditDebt that blocks new reservations until the user settles
+      // it (typically by buying another pack).
+      case 'PAYMENT_REFUNDED':
+        if (payload.payment) {
+          await this.payments.applyPaymentRefund(
+            payload.payment,
+            CreditDebtReason.REFUND,
+          );
+        }
+        break;
+      // Chargeback lifecycle — the issuer pulled the money back over a
+      // dispute. Same clawback as a refund. We don't differentiate the
+      // stages (requested vs dispute vs reversal) at the credit-ledger
+      // level — the first event wins via the idempotent claim and
+      // subsequent ones are no-ops.
+      case 'PAYMENT_CHARGEBACK_REQUESTED':
+      case 'PAYMENT_CHARGEBACK_DISPUTE':
+      case 'PAYMENT_AWAITING_CHARGEBACK_REVERSAL':
+        if (payload.payment) {
+          await this.payments.applyPaymentRefund(
+            payload.payment,
+            CreditDebtReason.CHARGEBACK,
+          );
+        }
+        break;
+      // Other events (SUBSCRIPTION_DELETED, etc.) are logged for
+      // observability — wire them when product needs them.
       default:
         this.logger.log(`Ignored Asaas event: ${payload.event}`);
     }

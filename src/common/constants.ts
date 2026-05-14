@@ -33,3 +33,30 @@ export const PASSWORD_RESET_TOKEN_TTL_MINUTES = 30;
 /// system-wide constant since the studio decided every arena uses the
 /// same deal.
 export const PIX_DISCOUNT_PERCENT = 5;
+
+/// Credit-card installment policy (Brazilian market standard).
+/// `CARD_INSTALLMENT_FREE_LIMIT` = max installments that the merchant
+/// absorbs (sem juros). Any installmentCount above this gets interest
+/// passed to the customer at `CARD_MONTHLY_INTEREST` (compound monthly).
+/// The financed total is `cash * (1 + rate)^N` and Asaas divides it
+/// across N installments. 2026-05-14 — switched from Asaas dashboard
+/// config to in-process calc so the math is auditable + deterministic
+/// in tests, and so the FE can show the exact financed total per option.
+export const CARD_INSTALLMENT_FREE_LIMIT = 3;
+export const CARD_MONTHLY_INTEREST = 0.0299;
+
+/// Returns the financed total (in cents) the customer pays for a card
+/// charge of `cashCents` paid in `installments` parcelas. Sem juros up to
+/// `CARD_INSTALLMENT_FREE_LIMIT`; compound monthly above that. Rounded to
+/// whole cents so the value matches the eventual receipt.
+export function computeFinancedTotalCents(
+  cashCents: number,
+  installments: number,
+): number {
+  if (installments <= CARD_INSTALLMENT_FREE_LIMIT) return cashCents;
+  // Only apply interest for installments AFTER the free limit (4+).
+  // For 4x: 1 month of interest; for 5x: 2 months; for 6x: 3 months.
+  const monthsWithInterest = installments - CARD_INSTALLMENT_FREE_LIMIT;
+  const factor = Math.pow(1 + CARD_MONTHLY_INTEREST, monthsWithInterest);
+  return Math.round(cashCents * factor);
+}

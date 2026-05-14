@@ -8,6 +8,12 @@ import { AppModule } from './app.module';
 async function bootstrap() {
   const app = await NestFactory.create<NestExpressApplication>(AppModule);
 
+  // Trust the first proxy hop so `req.ip` reflects the end-user, not the
+  // Railway edge. The card-charge flow forwards `req.ip` to Asaas as
+  // `remoteIp` for anti-fraud — without trust proxy it would always be the
+  // proxy's address, jacking up false-decline rates.
+  app.set('trust proxy', 1);
+
   // Default Nest body-parser limits are 100kb — too tight for some legitimate
   // payloads (e.g. seed data, future bulk endpoints). Multipart is handled
   // separately by multer (in the controllers that use FileInterceptor), so

@@ -82,7 +82,6 @@ describe('Payments — Pix pack purchase (e2e)', () => {
     unitId = unit.id;
     const pack5 = await prisma.packOffer.create({
       data: {
-        unitId,
         classes: 5,
         priceCents: 20_000,
         expirationDays: 60,
@@ -92,7 +91,6 @@ describe('Payments — Pix pack purchase (e2e)', () => {
     pack5OfferId = pack5.id;
     const pack10 = await prisma.packOffer.create({
       data: {
-        unitId,
         classes: 10,
         priceCents: 35_000,
         expirationDays: 90,
@@ -145,7 +143,7 @@ describe('Payments — Pix pack purchase (e2e)', () => {
       where: { email: { startsWith: 'e2e-pix-' } },
     });
     await prisma.packOffer.deleteMany({
-      where: { unit: { slug: { startsWith: 'e2e-pix-' } } },
+      where: { classes: { in: [5, 10] } },
     });
     await prisma.unit.deleteMany({
       where: { slug: { startsWith: 'e2e-pix-' } },

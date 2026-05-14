@@ -24,13 +24,16 @@ import { UsersModule } from './users/users.module';
 import { WaitlistModule } from './waitlist/waitlist.module';
 import { WebhooksModule } from './webhooks/webhooks.module';
 
+const schedulerEnabled =
+  process.env.NODE_ENV !== 'test' && process.env.JOBS_DISABLED !== 'true';
+
 @Module({
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
       validate: validateEnv,
     }),
-    ScheduleModule.forRoot(),
+    ...(schedulerEnabled ? [ScheduleModule.forRoot()] : []),
     PrismaModule,
     AuthModule,
     UsersModule,
