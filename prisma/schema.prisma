@@ -226,6 +226,11 @@ model User {
   /// (e.g. staff created by admin with a temporary password). Cleared on
   /// first successful password change.
   mustChangePassword Boolean       @default(false)
+  /// 2026-05-14 — onboarding tour gate. False on signup; set to true the
+  /// first time the user finishes or skips the dashboard tour. Drives the
+  /// auto-open of the tour on the dashboard and the "rever tour" CTA in
+  /// the help FAB.
+  hasSeenOnboarding  Boolean       @default(false)
   /// Free-text bio shown on instructor profile (admin-managed). Required
   /// for INSTRUCTOR role — enforced at service layer.
   bio                String?

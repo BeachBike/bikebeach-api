@@ -457,6 +457,16 @@ export class UsersService {
     return this.findById(userId);
   }
 
+  /// Idempotently marks the dashboard onboarding tour as seen. Returns
+  /// silently if the flag was already true. No `findById` round-trip — the
+  /// controller responds 204.
+  async markOnboardingSeen(userId: string): Promise<void> {
+    await this.prisma.user.updateMany({
+      where: { id: userId, hasSeenOnboarding: false },
+      data: { hasSeenOnboarding: true },
+    });
+  }
+
   /// Upload (or replace) the instructor portrait. Accepts PNG (transparent,
   /// from `@imgly/background-removal`) or JPEG (raw photo, won't blend with
   /// the gradient frame — admin is warned in the UI). Saved as
@@ -562,6 +572,7 @@ export class UsersService {
         unitId: true,
         isActive: true,
         mustChangePassword: true,
+        hasSeenOnboarding: true,
         bio: true,
         photoUrl: true,
         primaryClassKindId: true,

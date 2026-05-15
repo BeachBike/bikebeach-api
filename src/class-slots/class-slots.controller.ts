@@ -18,6 +18,7 @@ import { BulkCheckInDto } from './dto/bulk-check-in.dto';
 import { CancelClassSlotDto } from './dto/cancel-class-slot.dto';
 import { CreateClassSlotDto } from './dto/create-class-slot.dto';
 import { FriendsAttendingBatchDto } from './dto/friends-attending-batch.dto';
+import { ToggleCheckInDto } from './dto/toggle-check-in.dto';
 import { UpdateClassSlotDto } from './dto/update-class-slot.dto';
 
 @Controller('class-slots')
@@ -113,6 +114,26 @@ export class ClassSlotsController {
     @CurrentUser() user: AuthenticatedUser,
   ) {
     return this.slots.bulkCheckIn(id, dto.presentReservationIds, user);
+  }
+
+  /// Live tap on the AO VIVO professor screen — flip one reservation
+  /// between presente and ausente without resubmitting the whole roster.
+  @Roles(Role.ADMIN, Role.INSTRUCTOR)
+  @Post(':id/toggle-check-in')
+  toggleCheckIn(
+    @Param('id') id: string,
+    @Body() dto: ToggleCheckInDto,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.slots.toggleCheckIn(id, dto.reservationId, dto.present, user);
+  }
+
+  /// Instructor-triggered "finalizar aula". Closes the slot manually so
+  /// the professor doesn't depend on the cron.
+  @Roles(Role.ADMIN, Role.INSTRUCTOR)
+  @Post(':id/finalize')
+  finalize(@Param('id') id: string, @CurrentUser() user: AuthenticatedUser) {
+    return this.slots.finalize(id, user);
   }
 
   /// Authenticated overlay: returns which of the caller's friends are on

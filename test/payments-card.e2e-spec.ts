@@ -256,13 +256,13 @@ describe('Payments — Card pack purchase (e2e)', () => {
       });
     });
 
-    it('4x applies 2,99% compound — totalValue = cash * 1.0299^4', async () => {
+    it('4x applies 2,99% — apenas sobre os meses excedentes ao free limit', async () => {
       mockAsaas.createCardPayment.mockResolvedValueOnce({
         id: 'pay_card_4x',
         customer: 'cus_card_test',
         billingType: 'CREDIT_CARD',
         status: 'CONFIRMED',
-        value: 450.1,
+        value: 411.96,
         installmentCount: 4,
         creditCard: { creditCardNumber: '1111', creditCardBrand: 'VISA' },
       });
@@ -280,16 +280,17 @@ describe('Payments — Card pack purchase (e2e)', () => {
 
       expect(res.body.installments).toBe(4);
       expect(res.body.status).toBe('PAID');
-      // 40000 * 1.0299^4 ≈ 45003 cents (rounded). Snapshot the exact
-      // value — drift here would mean the rate / power formula changed.
-      expect(res.body.amountCents).toBe(45_003);
+      // 4x = 1 mês excedente ao free limit (3). 40000 * 1.0299^1 = 41196.
+      // 5x viraria 40000 * 1.0299^2 = 42426; 6x = 40000 * 1.0299^3 = 43683.
+      // Snapshot da fórmula — quebra aqui = fórmula mudou.
+      expect(res.body.amountCents).toBe(41_196);
       expect(res.body.cashPriceCents).toBe(40_000);
-      expect(res.body.interestCents).toBe(5_003);
+      expect(res.body.interestCents).toBe(1_196);
 
       const payload = mockAsaas.createCardPayment.mock.calls[0][0];
       expect(payload).toMatchObject({
         installmentCount: 4,
-        totalValue: 450.03,
+        totalValue: 411.96,
       });
       expect(payload).not.toHaveProperty('value');
     });

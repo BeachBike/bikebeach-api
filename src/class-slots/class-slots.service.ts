@@ -10,13 +10,11 @@ import {
   CancellationKind,
   ClassSlotStatus,
   PersonalCancellationReason,
+  ReservationStatus,
   Role,
   StudioCancellationReason,
 } from '@prisma/client';
-import {
-  assertCanAccessUnit,
-  assertCanManageSlot,
-} from '../common/tenancy';
+import { assertCanAccessUnit, assertCanManageSlot } from '../common/tenancy';
 import type { AuthenticatedUser } from '../common/types/authenticated-user.type';
 import { FriendsService } from '../friends/friends.service';
 import { PrismaService } from '../prisma/prisma.service';
@@ -479,7 +477,10 @@ export class ClassSlotsService {
     }
 
     const startsAt = dto.startsAt ? new Date(dto.startsAt) : undefined;
-    if (startsAt && (Number.isNaN(startsAt.getTime()) || startsAt <= new Date())) {
+    if (
+      startsAt &&
+      (Number.isNaN(startsAt.getTime()) || startsAt <= new Date())
+    ) {
       throw new BadRequestException('A aula precisa começar no futuro');
     }
 
@@ -554,11 +555,7 @@ export class ClassSlotsService {
     }
   }
 
-  async cancel(
-    id: string,
-    dto: CancelClassSlotDto,
-    user: AuthenticatedUser,
-  ) {
+  async cancel(id: string, dto: CancelClassSlotDto, user: AuthenticatedUser) {
     const slot = await this.findOne(id);
     assertCanManageSlot(user, slot);
     return this.executeCancel(slot, dto, user.id);
@@ -671,9 +668,7 @@ export class ClassSlotsService {
     const validIds = new Set(reservations.map((r) => r.id));
     const stranger = presentReservationIds.find((rid) => !validIds.has(rid));
     if (stranger) {
-      throw new BadRequestException(
-        'Reserva não pertence a essa aula',
-      );
+      throw new BadRequestException('Reserva não pertence a essa aula');
     }
 
     const now = new Date();
@@ -731,6 +726,112 @@ export class ClassSlotsService {
     return result;
   }
 
+  /// Single-reservation toggle for the "AO VIVO" professor screen.
+  /// `present=true` flips the row to CHECKED_IN; `present=false` flips it to
+  /// NO_SHOW (instructor-marked). This works both **before** the class
+  /// starts (the prof can open the screen 10 min early and get the
+  /// attendance board ready) and **during** it — the toggle is fully
+  /// reversible, so a mistap or an early arrival is just one more tap.
+  /// Honors the same locks as `bulkCheckIn` — user-marked NO_SHOW is
+  /// sacred. Returns the new status so the UI can update without a refetch.
+  async toggleCheckIn(
+    slotId: string,
+    reservationId: string,
+    present: boolean,
+    user: AuthenticatedUser,
+  ): Promise<{ reservationId: string; status: ReservationStatus }> {
+    const slot = await this.findOne(slotId);
+    assertCanManageSlot(user, slot);
+
+    if (slot.status !== ClassSlotStatus.SCHEDULED) {
+      throw new BadRequestException(
+        'Só é possível mexer na presença em aulas agendadas',
+      );
+    }
+
+    const reservation = await this.prisma.reservation.findUnique({
+      where: { id: reservationId },
+      select: {
+        id: true,
+        classSlotId: true,
+        status: true,
+        cancellationReason: true,
+      },
+    });
+    if (!reservation || reservation.classSlotId !== slotId) {
+      throw new BadRequestException('Reserva não pertence a essa aula');
+    }
+
+    // Locks (same rules as bulkCheckIn).
+    if (
+      reservation.status === 'NO_SHOW' &&
+      !isInstructorMarkedNoShowReason(reservation.cancellationReason)
+    ) {
+      throw new BadRequestException(
+        'Aluno marcou a própria ausência — não pode reverter',
+      );
+    }
+    // 2026-05 — under the "presença é o padrão" model, CHECKED_IN is often
+    // an *automatic* default (set by `autoConfirmStartFor` at +10min), not a
+    // deliberate confirmation. So the professor MUST be able to flip
+    // CHECKED_IN → NO_SHOW when they spot an absence — the old "presença
+    // confirmada não pode ser desfeita" lock contradicted the new model and
+    // is gone. The only sacred lock left is user-marked NO_SHOW (above).
+    if (
+      reservation.status !== 'ACTIVE' &&
+      reservation.status !== 'CHECKED_IN' &&
+      reservation.status !== 'NO_SHOW'
+    ) {
+      // CANCELLED_* / COMPLETED — out of scope for live check-in.
+      throw new BadRequestException('Reserva fora do estado de presença');
+    }
+
+    const now = new Date();
+    if (present) {
+      await this.prisma.reservation.update({
+        where: { id: reservation.id },
+        data: {
+          status: 'CHECKED_IN',
+          checkedInAt: now,
+          cancellationReason: null,
+        },
+      });
+      return { reservationId: reservation.id, status: 'CHECKED_IN' };
+    }
+
+    // Mark absent → NO_SHOW, regardless of whether the class has started.
+    // Under "presença é o padrão" the prof's job is to flag the absent
+    // ones; that flag must produce a *visible* NO_SHOW even in the 10-min
+    // pre-class window (otherwise the tap looks like a no-op). It's
+    // reversible: tapping again sends `present=true` and the row goes back
+    // to CHECKED_IN. `activeKey: null` releases the (slot,bike) seat — same
+    // as the during-class behavior; booking is already closed this close
+    // to start, so nothing re-grabs it.
+    await this.prisma.reservation.update({
+      where: { id: reservation.id },
+      data: {
+        status: 'NO_SHOW',
+        activeKey: null,
+        cancellationReason: INSTRUCTOR_NO_SHOW_REASON,
+      },
+    });
+    return { reservationId: reservation.id, status: 'NO_SHOW' };
+  }
+
+  /// Instructor-facing "finalizar aula" — wraps `completeBySchedule` with
+  /// the same auth check the rest of the manage actions use. Lets the
+  /// professor close the class manually instead of waiting on the cron.
+  async finalize(id: string, user: AuthenticatedUser) {
+    const slot = await this.findOne(id);
+    assertCanManageSlot(user, slot);
+    if (slot.status !== ClassSlotStatus.SCHEDULED) {
+      throw new BadRequestException(
+        'Só dá pra finalizar aulas agendadas (essa já está em outro estado)',
+      );
+    }
+    return this.completeBySchedule(id);
+  }
+
   /// Cron-triggered cancellation. No auth check — the caller is the system
   /// itself (`ClassSlotJobsService`). Stored as `cancelledByUserId = null`
   /// so it's distinguishable from human cancellations in the audit trail.
@@ -740,8 +841,17 @@ export class ClassSlotsService {
   }
 
   /// Mark a slot COMPLETED — only valid transition from SCHEDULED.
-  /// ACTIVE reservations become NO_SHOW (user reserved but never checked in,
-  /// credit is already consumed). CHECKED_IN reservations become COMPLETED.
+  ///
+  /// Attendance model (2026-05): **presença é o padrão**. The professor's
+  /// job on the AO VIVO screen is to mark the *absent* ones; anyone left
+  /// untouched is treated as present. So on completion:
+  ///   - ACTIVE     → COMPLETED  (reserved, professor never flagged them →
+  ///                  give the benefit of the doubt; "melhor todos presença
+  ///                  do que todos ausência" se o professor esquecer)
+  ///   - CHECKED_IN → COMPLETED  (explicitly present)
+  ///   - NO_SHOW    → stays NO_SHOW (professor or user flagged the absence)
+  /// Credit was already consumed at reservation time, so this only affects
+  /// attendance records / metrics, not the wallet.
   /// Idempotent: re-calling on an already-COMPLETED slot is a no-op.
   async completeBySchedule(id: string) {
     const slot = await this.prisma.classSlot.findUnique({ where: { id } });
@@ -749,15 +859,11 @@ export class ClassSlotsService {
     if (slot.status !== ClassSlotStatus.SCHEDULED) return slot;
 
     return this.prisma.$transaction(async (tx) => {
+      // ACTIVE + CHECKED_IN both land on COMPLETED — absence is opt-in,
+      // and by finalize time it must have been set explicitly via the
+      // live screen (or it isn't an absence).
       await tx.reservation.updateMany({
-        where: { classSlotId: id, status: 'ACTIVE' },
-        data: {
-          status: 'NO_SHOW',
-          activeKey: null,
-        },
-      });
-      await tx.reservation.updateMany({
-        where: { classSlotId: id, status: 'CHECKED_IN' },
+        where: { classSlotId: id, status: { in: ['ACTIVE', 'CHECKED_IN'] } },
         data: {
           status: 'COMPLETED',
           activeKey: null,
@@ -815,9 +921,7 @@ export class ClassSlotsService {
           status: newStatus,
           cancellationKind: dto.kind,
           personalCancellationReason:
-            dto.kind === CancellationKind.PERSONAL
-              ? dto.personalReason
-              : null,
+            dto.kind === CancellationKind.PERSONAL ? dto.personalReason : null,
           studioCancellationReason:
             dto.kind === CancellationKind.STUDIO ? dto.studioReason : null,
           cancellationDescription: dto.description ?? null,
@@ -834,5 +938,4 @@ export class ClassSlotsService {
       };
     });
   }
-
 }

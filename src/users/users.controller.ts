@@ -43,6 +43,15 @@ export class UsersController {
     return this.users.updateMe(user.id, dto);
   }
 
+  /// Marks the dashboard onboarding tour as seen. Called when the user
+  /// finishes or skips the tour. Idempotent — second call is a no-op
+  /// (the field is already true). 204 No Content keeps the FE lean.
+  @Patch('me/onboarding-seen')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  async markOnboardingSeen(@CurrentUser() user: AuthenticatedUser) {
+    await this.users.markOnboardingSeen(user.id);
+  }
+
   @Roles(Role.ADMIN)
   @Get('staff')
   listStaff(

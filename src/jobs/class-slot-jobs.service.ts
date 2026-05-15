@@ -29,8 +29,10 @@ const AUTO_CONFIRM_GRACE_MS = 10 * 60_000;
 ///      `STUDIO / BAIXA_ADESAO`. Excluded from metrics, reservations get
 ///      refunded (no-op since none exist), audit trail records the cancel.
 ///   2. **markCompleted** — slots whose `startsAt + durationMinutes` is in
-///      the past transition `SCHEDULED → COMPLETED`. Their reservations
-///      transition `ACTIVE → NO_SHOW` and `CHECKED_IN → COMPLETED`.
+///      the past transition `SCHEDULED → COMPLETED`. Reservations still
+///      ACTIVE or CHECKED_IN both become COMPLETED — presença é o padrão,
+///      só fica NO_SHOW quem foi explicitamente marcado ausente. See
+///      `completeBySchedule`.
 ///
 /// Order matters: autoCancel runs first so empty slots become CANCELLED
 /// instead of COMPLETED. Both jobs are idempotent — re-running picks no-ops
