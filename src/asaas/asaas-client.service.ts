@@ -68,6 +68,30 @@ function redactCardData(body: unknown): unknown {
   return clone;
 }
 
+/// Redacts LGPD-sensitive fields on the Asaas RESPONSE side. Customer
+/// payloads echo back CPF/CNPJ, address, phone, mobilePhone — none of which
+/// belong in a verbose debug log. Kept as a shallow scrub: the response
+/// objects are flat dicts so a deep walk isn't needed.
+const RESPONSE_PII_FIELDS = [
+  'cpfCnpj',
+  'address',
+  'addressNumber',
+  'complement',
+  'postalCode',
+  'phone',
+  'mobilePhone',
+  'email',
+];
+
+function redactResponsePii(body: unknown): unknown {
+  if (!body || typeof body !== 'object') return body;
+  const clone: Record<string, unknown> = { ...(body as Record<string, unknown>) };
+  for (const field of RESPONSE_PII_FIELDS) {
+    if (field in clone && clone[field] != null) clone[field] = '[REDACTED]';
+  }
+  return clone;
+}
+
 /// Thin wrapper over the Asaas v3 REST API. Pure HTTP — no business rules.
 /// Tests override this provider with a Jest mock so they never hit the network.
 @Injectable()
@@ -164,7 +188,13 @@ export class AsaasClientService {
     }
     
     const data = (await res.json()) as T;
-    this.logger.debug(`[Asaas] Response ${method} ${path}`, { data });
+    // Strip CPF/address/phone/e-mail from the debug log — Asaas echoes
+    // the full customer object on /customers and /payments?include=customer
+    // calls, and we don't want that PII landing in stdout / log aggregators
+    // if anyone flips on DEBUG in prod.
+    this.logger.debug(`[Asaas] Response ${method} ${path}`, {
+      data: redactResponsePii(data),
+    });
     return data;
   }
 }

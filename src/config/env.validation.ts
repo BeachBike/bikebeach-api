@@ -61,6 +61,64 @@ class EnvVars {
   @IsString()
   @IsOptional()
   CORS_ORIGINS?: string;
+
+  /// Resend API key (https://resend.com). When unset, the mailer logs the
+  /// rendered HTML to the console and records the send as SKIPPED in
+  /// EmailLog — no outbound request. Set this in production to actually
+  /// deliver e-mail.
+  @IsString()
+  @IsOptional()
+  RESEND_API_KEY?: string;
+
+  /// From header for outbound e-mail, e.g. `bikebeach <ola@bikebeach.com.br>`.
+  /// Must be a verified sender in Resend.
+  @IsString()
+  @IsOptional()
+  EMAIL_FROM: string = 'bikebeach <ola@bikebeach.com.br>';
+
+  /// Public base URL of the web app — used to build links inside templates
+  /// (CTA buttons, password-reset URLs, etc.). No trailing slash.
+  @IsString()
+  @IsOptional()
+  APP_URL: string = 'http://localhost:5173';
+
+  /// 32-byte AES-256 key (base64) used to encrypt CPFs at rest (LGPD).
+  /// Optional at boot — the app still starts without it; only flows that
+  /// touch CPF (signup with CPF, /users/me, Asaas customer sync) throw if
+  /// it's missing. Generate with `openssl rand -base64 32` or
+  /// `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`.
+  @IsString()
+  @IsOptional()
+  CPF_ENCRYPTION_KEY?: string;
+
+  /// Cloudflare R2 — object storage for instructor portraits. All five vars
+  /// must be set together; if any is missing the StorageService falls back
+  /// to local disk (`/uploads/instructors/`), which is fine for dev.
+  /// In prod, set all five so photos survive container restarts and the
+  /// FE serves them from the CDN edge.
+  @IsString()
+  @IsOptional()
+  R2_ACCOUNT_ID?: string;
+
+  @IsString()
+  @IsOptional()
+  R2_ACCESS_KEY_ID?: string;
+
+  @IsString()
+  @IsOptional()
+  R2_SECRET_ACCESS_KEY?: string;
+
+  @IsString()
+  @IsOptional()
+  R2_BUCKET?: string;
+
+  /// Public base URL of the bucket. Either the R2-managed `*.r2.dev` URL or
+  /// a custom domain you set up in Cloudflare. No trailing slash.
+  /// e.g. `https://media.bikebeach.com.br` or
+  /// `https://pub-<hash>.r2.dev`.
+  @IsString()
+  @IsOptional()
+  R2_PUBLIC_URL?: string;
 }
 
 export function validateEnv(config: Record<string, unknown>): EnvVars {

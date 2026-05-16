@@ -22,7 +22,7 @@ export class UpdateStaffUserDto {
   /// on next login (mustChangePassword auto-set when this field is sent).
   @IsOptional()
   @IsString()
-  @MinLength(8)
+  @MinLength(10)
   @MaxLength(72)
   password?: string;
 

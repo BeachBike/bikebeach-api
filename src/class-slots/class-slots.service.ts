@@ -3,8 +3,10 @@ import {
   ConflictException,
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import {
   BikeStatus,
   CancellationKind,
@@ -16,8 +18,11 @@ import {
 } from '@prisma/client';
 import { assertCanAccessUnit, assertCanManageSlot } from '../common/tenancy';
 import type { AuthenticatedUser } from '../common/types/authenticated-user.type';
+import { BikeHoldsService } from '../bike-holds/bike-holds.service';
 import { FriendsService } from '../friends/friends.service';
+import { MailerService } from '../mailer/mailer.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { RealtimeService } from '../realtime/realtime.service';
 import { ReservationsService } from '../reservations/reservations.service';
 import { WaitlistService } from '../waitlist/waitlist.service';
 import { CancelClassSlotDto } from './dto/cancel-class-slot.dto';
@@ -46,14 +51,97 @@ function isInstructorMarkedNoShowReason(
   return reason.toLowerCase().startsWith('ausência marcada pelo professor');
 }
 
+const STUDIO_REASON_LABELS: Record<StudioCancellationReason, string> = {
+  CHUVA: 'chuva forte na beira-mar — não dá pra pedalar com segurança',
+  VENTO: 'vento muito forte na praia hoje',
+  RAIO: 'raios próximos à linha — segurança em primeiro lugar',
+  TECNICO: 'problema técnico no estúdio',
+  MAR_ALTO: 'mar agitado demais perto da arena',
+  MANUTENCAO: 'manutenção emergencial no equipamento',
+  SEGURANCA: 'questão de segurança operacional',
+  BAIXA_ADESAO: 'baixa adesão — a aula ficou sem alunos',
+  OUTRO: 'aula cancelada pela equipe',
+};
+
+const PERSONAL_REASON_LABELS: Record<PersonalCancellationReason, string> = {
+  SAUDE: 'a instrutora não pôde dar aula hoje (questão de saúde)',
+  PESSOAL: 'a instrutora não pôde dar aula hoje',
+  CLIMA: 'condições do tempo não permitiram a aula',
+  OUTRO: 'aula cancelada pela equipe',
+};
+
 @Injectable()
 export class ClassSlotsService {
+  private readonly logger = new Logger(ClassSlotsService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly reservations: ReservationsService,
     private readonly waitlist: WaitlistService,
     private readonly friends: FriendsService,
+    private readonly mailer: MailerService,
+    private readonly config: ConfigService,
+    private readonly realtime: RealtimeService,
+    private readonly holds: BikeHoldsService,
   ) {}
+
+  private appUrl(): string {
+    return (this.config.get<string>('APP_URL') ?? 'http://localhost:5173').replace(/\/$/, '');
+  }
+
+  /// Fires one CLASS_CANCELLED e-mail per reservation that was cancelled by
+  /// the studio cancel flow. Called AFTER the cancel transaction commits.
+  private async sendClassCancelledEmails(slotId: string, dto: CancelClassSlotDto): Promise<void> {
+    const slot = await this.prisma.classSlot.findUnique({
+      where: { id: slotId },
+      include: {
+        classKind: { select: { name: true } },
+        instructor: { select: { name: true } },
+        reservations: {
+          where: { status: ReservationStatus.CANCELLED_BY_STUDIO },
+          include: {
+            user: { select: { id: true, name: true, email: true } },
+            bike: { select: { label: true } },
+          },
+        },
+      },
+    });
+    if (!slot) return;
+
+    const reasonKey =
+      dto.kind === CancellationKind.PERSONAL ? dto.personalReason : dto.studioReason;
+    const reasonLabel =
+      dto.kind === CancellationKind.PERSONAL
+        ? PERSONAL_REASON_LABELS[dto.personalReason as PersonalCancellationReason]
+        : STUDIO_REASON_LABELS[dto.studioReason as StudioCancellationReason];
+
+    for (const reservation of slot.reservations) {
+      if (!reservation.user) continue;
+      try {
+        await this.mailer.send({
+          template: 'CLASS_CANCELLED',
+          to: reservation.user.email,
+          userId: reservation.user.id,
+          payload: {
+            name: reservation.user.name,
+            classKind: slot.classKind?.name ?? slot.title ?? 'aula',
+            instructorName: slot.instructor?.name ?? 'instrutor',
+            startsAt: slot.startsAt.toISOString(),
+            bikeLabel: reservation.bike.label,
+            reason: reasonKey ?? 'OUTRO',
+            reasonLabel: reasonLabel ?? 'aula cancelada pela equipe',
+            description: dto.description ?? null,
+            refundedCredits: 1,
+            rebookUrl: `${this.appUrl()}/reservar`,
+          },
+        });
+      } catch (err) {
+        this.logger.warn(
+          `class-cancelled email skipped for ${reservation.id}: ${(err as Error).message}`,
+        );
+      }
+    }
+  }
 
   async create(dto: CreateClassSlotDto, user: AuthenticatedUser) {
     assertCanAccessUnit(user, dto.unitId);
@@ -274,11 +362,18 @@ export class ClassSlotsService {
     });
     const occupiedBikeIds = reservations.map((r) => r.bikeId);
 
+    // Bikes another user is mid-booking (non-expired BikeHold). The FE
+    // paints these "em reserva" (charcoal, not selectable). It filters
+    // out the caller's own held bike client-side from `selectedBikeId`,
+    // so this can stay public/auth-free like the rest of the seat-map.
+    const heldBikeIds = await this.holds.activeHeldBikeIds(id);
+
     return {
       slot,
       unit: slot.unit,
       bikes,
       occupiedBikeIds,
+      heldBikeIds,
       freeSpots: Math.max(0, slot.capacity - reservations.length),
     };
   }
@@ -907,7 +1002,7 @@ export class ClassSlotsService {
         ? ClassSlotStatus.CANCELLED_BEFORE
         : ClassSlotStatus.CANCELLED_DURING;
 
-    return this.prisma.$transaction(async (tx) => {
+    const result = await this.prisma.$transaction(async (tx) => {
       const bulk = await this.reservations.bulkCancelByStudio(
         slot.id,
         cancelledByUserId,
@@ -937,5 +1032,43 @@ export class ClassSlotsService {
         waitlistCleared,
       };
     });
+
+    void this.sendClassCancelledEmails(slot.id, dto).catch((err) =>
+      this.logger.warn(
+        `class-cancelled email batch failed for slot ${slot.id}: ${(err as Error).message}`,
+      ),
+    );
+
+    // Realtime fan-out: seat-map watchers refetch (the slot will be in
+    // CANCELLED state now), and every affected user gets a direct event
+    // on their user-channel so the dashboard/reservar UI updates without
+    // a refresh. Fire-and-forget; errors swallowed by RealtimeService.
+    this.realtime.seatMapChanged(slot.id);
+    void this.notifyAffectedUsers(slot.id).catch((err) =>
+      this.logger.warn(
+        `class-cancelled realtime fan-out failed for slot ${slot.id}: ${(err as Error).message}`,
+      ),
+    );
+
+    return result;
+  }
+
+  /// Push `class:cancelled` to every user who had an ACTIVE/CHECKED_IN
+  /// reservation that was just flipped to CANCELLED_BY_STUDIO. The DB read
+  /// happens after the cancel tx so we see the freshly cancelled rows.
+  private async notifyAffectedUsers(slotId: string): Promise<void> {
+    const reservations = await this.prisma.reservation.findMany({
+      where: {
+        classSlotId: slotId,
+        status: ReservationStatus.CANCELLED_BY_STUDIO,
+      },
+      select: { userId: true, id: true },
+    });
+    for (const r of reservations) {
+      this.realtime.notifyUser(r.userId, 'class:cancelled', {
+        slotId,
+        reservationId: r.id,
+      });
+    }
   }
 }

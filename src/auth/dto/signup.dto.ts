@@ -9,13 +9,14 @@ import {
   MaxLength,
   MinLength,
 } from 'class-validator';
+import { IsCpfValid } from '../../common/decorators/is-cpf-valid.decorator';
 
 export class SignupDto {
   @IsEmail()
   email!: string;
 
   @IsString()
-  @MinLength(8, { message: 'Senha precisa ter no mínimo 8 caracteres' })
+  @MinLength(10, { message: 'Senha precisa ter no mínimo 10 caracteres' })
   @MaxLength(72, { message: 'Senha não pode passar de 72 caracteres' })
   password!: string;
 
@@ -29,13 +30,16 @@ export class SignupDto {
   @Matches(/^\+?[0-9\s\-()]{8,20}$/, { message: 'Telefone inválido' })
   phone?: string;
 
-  /// CPF (only digits, 11 chars). Optional at signup; required at first
-  /// purchase. We don't enforce mod-11 here — Asaas validates.
+  /// CPF — 11 digits, Mod-11-valid. Optional at signup; required at first
+  /// purchase. Format AND check-digits are enforced (rejects typos, all-
+  /// same-digit CPFs, etc.). Uniqueness is enforced at the DB layer via
+  /// `@unique` on `User.cpf` plus a friendly pre-check in `auth.signup`.
   @IsOptional()
   @IsString()
   @Matches(/^\d{11}$/, {
     message: 'CPF deve ter 11 dígitos numéricos (sem pontos/hífens)',
   })
+  @IsCpfValid()
   cpf?: string;
 
   /// Profile fields collected by the cadastro wizard. All optional — frontend

@@ -29,6 +29,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
         role: true,
         unitId: true,
         isActive: true,
+        passwordChangedAt: true,
         arenaAssignments:
           // INSTRUCTOR is the only role that uses the M2M for tenancy
           // checks; skip the join for everyone else.
@@ -38,6 +39,18 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     if (!user || !user.isActive) {
       throw new UnauthorizedException();
     }
+
+    // Reject access tokens issued before the user's last password change.
+    // `iat` is in seconds (JWT standard); compare with seconds-since-epoch
+    // floor of `passwordChangedAt` (minus 1s slack to absorb rounding
+    // between the DB write and the JWT-sign clock).
+    if (payload.iat) {
+      const passwordChangedSec = Math.floor(user.passwordChangedAt.getTime() / 1000) - 1;
+      if (payload.iat < passwordChangedSec) {
+        throw new UnauthorizedException('Token revogado pela troca de senha');
+      }
+    }
+
     return {
       id: user.id,
       email: user.email,

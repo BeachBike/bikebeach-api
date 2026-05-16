@@ -6,6 +6,7 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import {
   BikeStatus,
   ClassSlotStatus,
@@ -23,10 +24,26 @@ import {
 import { assertNoOpenCreditDebt } from '../common/credit-debt.guard';
 import { isGlobalAdmin } from '../common/tenancy';
 import type { AuthenticatedUser } from '../common/types/authenticated-user.type';
+import { BikeHoldsService } from '../bike-holds/bike-holds.service';
 import { HealthGateService } from '../health-gate/health-gate.service';
+import { MailerService } from '../mailer/mailer.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { RealtimeService } from '../realtime/realtime.service';
 import { WaitlistService } from '../waitlist/waitlist.service';
 import { CreateReservationDto } from './dto/create-reservation.dto';
+
+const INTENSITY_LABELS: Record<number, string> = {
+  1: 'leve',
+  2: 'moderada',
+  3: 'média',
+  4: 'forte',
+  5: 'intensa',
+};
+
+function intensityLabel(level?: number | null): string | null {
+  if (level == null) return null;
+  return INTENSITY_LABELS[level] ?? null;
+}
 
 @Injectable()
 export class ReservationsService {
@@ -36,6 +53,10 @@ export class ReservationsService {
     private readonly prisma: PrismaService,
     private readonly healthGate: HealthGateService,
     private readonly waitlist: WaitlistService,
+    private readonly mailer: MailerService,
+    private readonly config: ConfigService,
+    private readonly realtime: RealtimeService,
+    private readonly holds: BikeHoldsService,
   ) {}
 
   async create(dto: CreateReservationDto, user: AuthenticatedUser) {
@@ -146,6 +167,17 @@ export class ReservationsService {
       throw new BadRequestException('Sem créditos disponíveis');
     }
 
+    // 5b. Seat-hold guard. The atomic `activeKey` insert below already
+    //     prevents a true double-reservation, but if another user is
+    //     mid-flow holding this exact bike we reject early with a clean
+    //     409 so we don't consume this user's credit just to roll back.
+    //     The caller's own hold (or none) passes through.
+    await this.holds.assertNotHeldByOther(
+      dto.classSlotId,
+      dto.bikeId,
+      user.id,
+    );
+
     // 6. Transaction:
     //    - Decrement pack atomically (updateMany with `remaining > 0` filter
     //      so a concurrent request can't take the same credit twice).
@@ -154,7 +186,7 @@ export class ReservationsService {
     //      activeKey UNIQUE → P2002 → caller catches → 409.
     //    Any failure rolls back the credit decrement automatically.
     try {
-      return await this.prisma.$transaction(async (tx) => {
+      const reservation = await this.prisma.$transaction(async (tx) => {
         const decremented = await tx.creditPack.updateMany({
           where: { id: candidatePack.id, remainingCredits: { gt: 0 } },
           data: { remainingCredits: { decrement: 1 } },
@@ -174,6 +206,30 @@ export class ReservationsService {
           },
         });
       });
+
+      void this.sendReservationConfirmedEmail(reservation.id).catch((err) =>
+        this.logger.warn(
+          `reservation-confirmed email skipped for ${reservation.id}: ${(err as Error).message}`,
+        ),
+      );
+
+      // The hold (if any) became a real reservation — drop it so it
+      // doesn't linger and the `@@unique([slot,user])` frees for future
+      // flows. Fire-and-forget; the seatMapChanged below covers the UI.
+      void this.holds
+        .consumeOnReservation(dto.classSlotId, user.id)
+        .catch((err) =>
+          this.logger.warn(
+            `hold cleanup skipped for slot ${dto.classSlotId}: ${(err as Error).message}`,
+          ),
+        );
+
+      // Tell everyone watching this slot's seat-map that occupancy moved.
+      // Receivers refetch via REST. Fire-and-forget — RealtimeService
+      // never throws.
+      this.realtime.seatMapChanged(reservation.classSlotId);
+
+      return reservation;
     } catch (err) {
       if (
         err instanceof Prisma.PrismaClientKnownRequestError &&
@@ -290,6 +346,10 @@ export class ReservationsService {
       );
     }
 
+    // Freed seat → broadcast to anyone watching this slot. (The waitlist
+    // promotion path, if any, already emits its own user-channel event.)
+    this.realtime.seatMapChanged(reservation.classSlotId);
+
     return {
       id: reservationId,
       status: ReservationStatus.CANCELLED_BY_USER,
@@ -352,13 +412,17 @@ export class ReservationsService {
     }
 
     try {
-      return await this.prisma.reservation.update({
+      const updated = await this.prisma.reservation.update({
         where: { id: reservationId },
         data: {
           bikeId: newBikeId,
           activeKey: this.activeKeyFor(reservation.classSlotId, newBikeId),
         },
       });
+      // Both the old and the new bike's occupancy flipped — anyone on the
+      // seat-map needs to refetch. One broadcast covers the whole slot.
+      this.realtime.seatMapChanged(reservation.classSlotId);
+      return updated;
     } catch (err) {
       if (
         err instanceof Prisma.PrismaClientKnownRequestError &&
@@ -572,5 +636,55 @@ export class ReservationsService {
 
   private activeKeyFor(classSlotId: string, bikeId: string): string {
     return `${classSlotId}:${bikeId}`;
+  }
+
+  private appUrl(): string {
+    return (this.config.get<string>('APP_URL') ?? 'http://localhost:5173').replace(/\/$/, '');
+  }
+
+  /// Loads enough context to render the reservation-confirmed e-mail and
+  /// fires the dispatch through MailerService. Fire-and-forget; the caller
+  /// already returned the reservation to the user.
+  private async sendReservationConfirmedEmail(reservationId: string): Promise<void> {
+    const reservation = await this.prisma.reservation.findUnique({
+      where: { id: reservationId },
+      include: {
+        user: { select: { id: true, email: true, name: true } },
+        bike: { select: { label: true } },
+        classSlot: {
+          include: {
+            classKind: { select: { name: true, intensity: true } },
+            instructor: { select: { name: true } },
+            unit: { select: { name: true } },
+          },
+        },
+      },
+    });
+    if (!reservation || !reservation.user) return;
+
+    const startsAt = reservation.classSlot.startsAt;
+    const hours = reservation.promotedFromWaitlist
+      ? WAITLIST_PROTECTED_CANCELLATION_WINDOW_HOURS
+      : STANDARD_CANCELLATION_WINDOW_HOURS;
+    const cancelDeadlineAt = new Date(startsAt.getTime() - hours * 3_600_000);
+
+    await this.mailer.send({
+      template: 'RESERVATION_CONFIRMED',
+      to: reservation.user.email,
+      userId: reservation.user.id,
+      payload: {
+        name: reservation.user.name,
+        classKind: reservation.classSlot.classKind?.name ?? reservation.classSlot.title ?? 'aula',
+        instructorName: reservation.classSlot.instructor?.name ?? 'instrutor',
+        durationMinutes: reservation.classSlot.durationMinutes,
+        intensity: intensityLabel(reservation.classSlot.classKind?.intensity),
+        startsAt: startsAt.toISOString(),
+        bikeLabel: reservation.bike.label,
+        unitName: reservation.classSlot.unit?.name ?? '',
+        reservationUrl: `${this.appUrl()}/dashboard`,
+        cancelDeadlineAt: cancelDeadlineAt.toISOString(),
+        cancelDeadlineHours: hours as 8 | 2,
+      },
+    });
   }
 }

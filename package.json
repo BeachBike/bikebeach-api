@@ -17,24 +17,31 @@
     "test:watch": "jest --watch",
     "test:cov": "jest --coverage",
     "test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand",
-    "test:e2e": "set NODE_ENV=test&& set JOBS_DISABLED=true&& set DATABASE_URL=postgresql://app:app@localhost:5432/beachbike_test?schema=public&& prisma migrate deploy&& jest --config ./test/jest-e2e.json --runInBand --detectOpenHandles"
+    "test:e2e": "set NODE_ENV=test&& set JOBS_DISABLED=true&& set ASAAS_WEBHOOK_TOKEN=dev-webhook-token-change-in-prod-1234567890abcdef&& set CPF_ENCRYPTION_KEY=flFjW+aJBy1c3hRswcBl1O4tdGtnMeFtF5h1PHm1ccs=&& set DATABASE_URL=postgresql://app:app@localhost:5432/beachbike_test?schema=public&& prisma migrate deploy&& jest --config ./test/jest-e2e.json --runInBand --detectOpenHandles"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1047.0",
     "@nestjs/common": "^11.0.1",
     "@nestjs/config": "^4.0.4",
     "@nestjs/core": "^11.0.1",
     "@nestjs/jwt": "^11.0.2",
     "@nestjs/passport": "^11.0.5",
     "@nestjs/platform-express": "^11.0.1",
+    "@nestjs/platform-socket.io": "^11.1.21",
     "@nestjs/schedule": "^6.1.3",
+    "@nestjs/throttler": "^6.5.0",
+    "@nestjs/websockets": "^11.1.21",
     "@prisma/client": "^6.19.3",
     "bcrypt": "^6.0.0",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.15.1",
+    "file-type": "^22.0.1",
+    "helmet": "^8.1.0",
     "passport": "^0.7.0",
     "passport-jwt": "^4.0.1",
     "reflect-metadata": "^0.2.2",
-    "rxjs": "^7.8.1"
+    "rxjs": "^7.8.1",
+    "socket.io": "^4.8.3"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3.2.0",

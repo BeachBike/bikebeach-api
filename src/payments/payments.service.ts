@@ -28,7 +28,9 @@ import {
   computeFinancedTotalCents,
   PIX_DISCOUNT_PERCENT,
 } from '../common/constants';
+import { ConfigService } from '@nestjs/config';
 import { computeCampaignDiscountCents } from '../common/discount';
+import { MailerService } from '../mailer/mailer.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateCardPackDto } from './dto/create-card-pack.dto';
 
@@ -89,7 +91,53 @@ export class PaymentsService {
     private readonly prisma: PrismaService,
     private readonly asaas: AsaasClientService,
     private readonly customers: AsaasCustomersService,
+    private readonly mailer: MailerService,
+    private readonly config: ConfigService,
   ) {}
+
+  private appUrl(): string {
+    return (this.config.get<string>('APP_URL') ?? 'http://localhost:5173').replace(/\/$/, '');
+  }
+
+  /// Fires the PAYMENT_RECEIPT template for a Payment that just transitioned
+  /// to PAID. Called from `applyPaymentConfirmation` AFTER the transaction
+  /// commits — fire-and-forget so the webhook responds quickly. Skips
+  /// SUBSCRIPTION_CYCLE for now (we'd want a different "renovação" copy).
+  private async sendPaymentReceiptEmail(paymentId: string): Promise<void> {
+    const payment = await this.prisma.payment.findUnique({
+      where: { id: paymentId },
+      include: {
+        user: { select: { id: true, name: true, email: true } },
+        creditPacks: { select: { totalCredits: true, expiresAt: true }, take: 1 },
+      },
+    });
+    if (!payment || !payment.user) return;
+    if (payment.kind !== PaymentKind.ONE_OFF_PACK) return;
+    const pack = payment.creditPacks[0];
+    if (!pack) return;
+    const credits = pack.totalCredits;
+    const expiresAt = pack.expiresAt ?? new Date(Date.now() + 30 * 86_400_000);
+    const packLabel =
+      credits === 1
+        ? 'pacote 1 aula (avulsa)'
+        : `pacote ${credits} aulas`;
+    await this.mailer.send({
+      template: 'PAYMENT_RECEIPT',
+      to: payment.user.email,
+      userId: payment.user.id,
+      payload: {
+        name: payment.user.name,
+        packLabel,
+        amountCents: payment.amountCents,
+        method: payment.method,
+        installments: payment.installments ?? null,
+        paidAt: (payment.paidAt ?? new Date()).toISOString(),
+        credits,
+        expiresAt: expiresAt.toISOString(),
+        dashboardUrl: `${this.appUrl()}/dashboard`,
+      },
+    });
+  }
 
   async createPixPackCharge(
     userId: string,
@@ -569,6 +617,7 @@ export class PaymentsService {
     }
     const localRow = local;
 
+    let mintedPackId: string | null = null;
     await this.prisma.$transaction(async (tx) => {
       // Atomic claim. updateMany row-locks: if a concurrent caller (e.g.
       // the synchronous card path + the webhook arriving within ms) is
@@ -613,7 +662,7 @@ export class PaymentsService {
           localRow.packCredits,
           localRow.id,
         );
-        await tx.creditPack.create({
+        const pack = await tx.creditPack.create({
           data: {
             userId: localRow.userId,
             source: CreditSource.PURCHASE_PACK,
@@ -627,6 +676,7 @@ export class PaymentsService {
             maxSharedUsers: offer?.maxSharedUsers ?? 0,
           },
         });
+        mintedPackId = pack.id;
       } else if (
         localRow.kind === PaymentKind.SUBSCRIPTION_CYCLE &&
         localRow.subscriptionId
@@ -676,6 +726,14 @@ export class PaymentsService {
         });
       }
     });
+
+    if (mintedPackId) {
+      void this.sendPaymentReceiptEmail(localRow.id).catch((err) =>
+        this.logger.warn(
+          `payment-receipt email skipped for ${localRow.id}: ${(err as Error).message}`,
+        ),
+      );
+    }
   }
 
   /// Called from the webhook on `PAYMENT_CREATED` for subscription cycle

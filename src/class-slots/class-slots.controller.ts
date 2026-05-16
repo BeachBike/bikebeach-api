@@ -2,18 +2,23 @@ import {
   BadRequestException,
   Body,
   Controller,
+  Delete,
   Get,
+  HttpCode,
+  HttpStatus,
   Param,
   Patch,
   Post,
   Query,
 } from '@nestjs/common';
 import { ClassSlotStatus, Role } from '@prisma/client';
+import { BikeHoldsService } from '../bike-holds/bike-holds.service';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { Public } from '../common/decorators/public.decorator';
 import { Roles } from '../common/decorators/roles.decorator';
 import type { AuthenticatedUser } from '../common/types/authenticated-user.type';
 import { ClassSlotsService } from './class-slots.service';
+import { AcquireHoldDto } from './dto/acquire-hold.dto';
 import { BulkCheckInDto } from './dto/bulk-check-in.dto';
 import { CancelClassSlotDto } from './dto/cancel-class-slot.dto';
 import { CreateClassSlotDto } from './dto/create-class-slot.dto';
@@ -23,7 +28,10 @@ import { UpdateClassSlotDto } from './dto/update-class-slot.dto';
 
 @Controller('class-slots')
 export class ClassSlotsController {
-  constructor(private readonly slots: ClassSlotsService) {}
+  constructor(
+    private readonly slots: ClassSlotsService,
+    private readonly holds: BikeHoldsService,
+  ) {}
 
   @Roles(Role.ADMIN, Role.INSTRUCTOR)
   @Post()
@@ -69,6 +77,49 @@ export class ClassSlotsController {
   @Get(':id/seat-map')
   seatMap(@Param('id') id: string) {
     return this.slots.seatMap(id);
+  }
+
+  /// The caller's own current hold on this slot (or null). Used by the FE
+  /// to rehydrate the selection + countdown when the user returns to the
+  /// flow after leaving without an explicit "voltar".
+  @Get(':id/holds/mine')
+  myHold(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.holds.myHold(id, user.id);
+  }
+
+  /// Acquire (or move) a temporary exclusive hold on a bike while the
+  /// user is in the reservation flow. Auth required. 409 if another user
+  /// already holds / reserved the seat.
+  @Post(':id/holds')
+  acquireHold(
+    @Param('id') id: string,
+    @Body() dto: AcquireHoldDto,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.holds.acquire(id, dto.bikeId, user.id);
+  }
+
+  /// Re-touch the caller's hold to a fresh TTL — called when advancing to
+  /// the confirmation step so the full window applies there.
+  @Patch(':id/holds')
+  refreshHold(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.holds.refresh(id, user.id);
+  }
+
+  /// Release the caller's hold (back / leave the flow). Idempotent.
+  @Delete(':id/holds')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  async releaseHold(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ): Promise<void> {
+    await this.holds.release(id, user.id);
   }
 
   @Roles(Role.ADMIN, Role.INSTRUCTOR)

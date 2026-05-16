@@ -7,33 +7,38 @@ import {
 } from '@nestjs/common';
 import { Prisma, Role } from '@prisma/client';
 import { hash } from 'bcrypt';
-import { promises as fs } from 'fs';
-import { join } from 'path';
+import { encryptCpf, tryDecryptCpf } from '../common/cpf-crypto';
 import type { AuthenticatedUser } from '../common/types/authenticated-user.type';
 import { PrismaService } from '../prisma/prisma.service';
+import { StorageService } from '../storage/storage.service';
 import { CreateStaffUserDto } from './dto/create-staff-user.dto';
 import { UpdateMeDto } from './dto/update-me.dto';
 import { UpdateStaffUserDto } from './dto/update-staff-user.dto';
 
-/// Disk layout mirrors what's served as static under `/uploads/instructors/`
-/// in `main.ts`. We write `<userId>.png` so re-upload overwrites the previous
-/// file and there's nothing to garbage-collect when a different file extension
-/// is uploaded. PNG only — frontend produces a transparent PNG via
-/// `@imgly/background-removal` before sending.
-const INSTRUCTOR_PHOTOS_DIR = join(process.cwd(), 'uploads', 'instructors');
-const INSTRUCTOR_PHOTO_PUBLIC_PREFIX = '/uploads/instructors';
 /// 8MB matches the controller's multer limit. Transparent PNGs from
 /// `@imgly/background-removal` are bigger than typical JPGs because they
 /// carry an alpha channel and use lossless compression.
 const MAX_PHOTO_BYTES = 8 * 1024 * 1024;
-/// Mimetypes the instructor photo upload accepts. PNG is the recommended
-/// path (transparent background, blends with the gradient frame). JPEG is a
-/// fallback for admins who already removed the background elsewhere or are
-/// fine with the rectangular look — frontend warns about the visual impact.
-const MIME_TO_EXT: Record<string, string> = {
-  'image/png': 'png',
-  'image/jpeg': 'jpg',
-};
+
+/// Magic-byte signatures for the formats we accept. Browser-supplied
+/// `file.mimetype` is trivially forgeable; checking the actual leading
+/// bytes prevents an attacker from uploading e.g. an HTML file under a
+/// PNG mimetype and getting it served from our storage as `userId.png`.
+const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const JPEG_MAGIC = Buffer.from([0xff, 0xd8, 0xff]);
+
+function sniffImageType(buffer: Buffer): 'png' | 'jpg' | null {
+  if (buffer.length >= PNG_MAGIC.length && buffer.subarray(0, PNG_MAGIC.length).equals(PNG_MAGIC)) {
+    return 'png';
+  }
+  if (
+    buffer.length >= JPEG_MAGIC.length &&
+    buffer.subarray(0, JPEG_MAGIC.length).equals(JPEG_MAGIC)
+  ) {
+    return 'jpg';
+  }
+  return null;
+}
 
 const BCRYPT_ROUNDS = 12;
 
@@ -105,7 +110,10 @@ function flattenSpecialties<
 
 @Injectable()
 export class UsersService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly storage: StorageService,
+  ) {}
 
   async createStaff(dto: CreateStaffUserDto) {
     // 2026-05 — INSTRUCTOR multi-arena: prefer `unitIds` (1+ required).
@@ -419,22 +427,40 @@ export class UsersService {
     const data: Prisma.UserUpdateInput = {};
     if (dto.email !== undefined) data.email = dto.email;
     if (dto.phone !== undefined) data.phone = dto.phone === '' ? null : dto.phone;
-    if (dto.cpf !== undefined) data.cpf = dto.cpf === '' ? null : dto.cpf;
+    if (dto.cpf !== undefined) {
+      // Encrypt CPF before persisting (LGPD). The deterministic AES-GCM
+      // scheme means the `@unique` constraint on `User.cpf` continues to
+      // work on the ciphertext column.
+      data.cpf = dto.cpf === '' ? null : encryptCpf(dto.cpf);
+    }
     if (dto.birthDate !== undefined) {
-      // Parse "YYYY-MM-DD" as local date (not UTC). Split and construct
-      // so timezone doesn't shift the day. E.g. "2000-05-15" → May 15, 2000
-      // in the local timezone, not UTC (which would be May 14 in -3).
+      // "YYYY-MM-DD" → UTC midnight (NOT host-local midnight). Anchoring to
+      // UTC makes the date round-trip identical in every viewer's browser
+      // and on every API host. The pre-fix path used `new Date(y, m-1, d)`,
+      // which on Railway (UTC) wrote `T00:00:00Z` and rendered as the
+      // previous day for UTC-3 browsers (birthDate off-by-one bug).
       const [year, month, day] = dto.birthDate.split('-');
       data.birthDate = new Date(
-        parseInt(year),
-        parseInt(month) - 1, // JS months are 0-indexed
-        parseInt(day),
+        Date.UTC(parseInt(year), parseInt(month) - 1, parseInt(day)),
       );
     }
     if (Object.keys(data).length === 0) {
       // Nothing to update — short-circuit and return the current snapshot
       // so the client can still refresh local state.
       return this.findById(userId);
+    }
+    // Friendly pre-check for duplicate CPF — the DB unique on User.cpf is
+    // the safety net (caught by the P2002 handler below) but this lets us
+    // 409 cleanly without a Prisma error shape. Allow the same user to
+    // "update" with their own current CPF (no-op).
+    if (typeof data.cpf === 'string' && data.cpf.length > 0) {
+      const byCpf = await this.prisma.user.findFirst({
+        where: { cpf: data.cpf, NOT: { id: userId } },
+        select: { id: true },
+      });
+      if (byCpf) {
+        throw new ConflictException('CPF já cadastrado');
+      }
     }
     try {
       await this.prisma.user.update({ where: { id: userId }, data });
@@ -484,12 +510,17 @@ export class UsersService {
     if (file.size > MAX_PHOTO_BYTES) {
       throw new BadRequestException('Imagem maior que 8MB');
     }
-    const ext = MIME_TO_EXT[file.mimetype];
-    if (!ext) {
+    // `file.mimetype` is set by the browser and can lie. We sniff the
+    // actual leading bytes to decide whether it's really a PNG or JPEG;
+    // anything else (HTML, SVG with <script>, arbitrary binary) is
+    // rejected before it ever lands on disk / in the bucket.
+    const sniffed = sniffImageType(file.buffer);
+    if (!sniffed) {
       throw new BadRequestException(
-        'Imagem precisa ser PNG ou JPG.',
+        'Imagem precisa ser PNG ou JPG válido.',
       );
     }
+    const contentType = sniffed === 'png' ? 'image/png' : 'image/jpeg';
     const target = await this.prisma.user.findUnique({
       where: { id: targetUserId },
       select: { id: true, role: true },
@@ -499,22 +530,16 @@ export class UsersService {
       throw new BadRequestException('Apenas staff pode ter foto de perfil');
     }
 
-    await fs.mkdir(INSTRUCTOR_PHOTOS_DIR, { recursive: true });
-    // Drop every previous variant (png/jpg/jpeg) so swapping format doesn't
-    // leave a stale file under another extension.
-    await this.removeInstructorPhotoFiles(targetUserId);
-    const filename = `${targetUserId}.${ext}`;
-    const fullPath = join(INSTRUCTOR_PHOTOS_DIR, filename);
-    await fs.writeFile(fullPath, file.buffer);
-
-    // Cache-bust: append the mtime so the frontend doesn't show a stale image
-    // after re-upload. The static handler ignores the query string.
-    const cacheBust = Date.now();
-    const photoUrl = `${INSTRUCTOR_PHOTO_PUBLIC_PREFIX}/${filename}?v=${cacheBust}`;
+    const { publicUrl } = await this.storage.putInstructorPhoto(
+      targetUserId,
+      file.buffer,
+      contentType,
+      sniffed,
+    );
 
     return this.prisma.user.update({
       where: { id: targetUserId },
-      data: { photoUrl },
+      data: { photoUrl: publicUrl },
       select: STAFF_SELECT,
     }).then(flattenSpecialties);
   }
@@ -527,26 +552,13 @@ export class UsersService {
     });
     if (!target) throw new NotFoundException('Usuário não encontrado');
     if (target.photoUrl) {
-      await this.removeInstructorPhotoFiles(targetUserId);
+      await this.storage.deleteInstructorPhoto(targetUserId);
     }
     return this.prisma.user.update({
       where: { id: targetUserId },
       data: { photoUrl: null },
       select: STAFF_SELECT,
     }).then(flattenSpecialties);
-  }
-
-  /// Best-effort delete of every variant we might have written (png/jpg).
-  /// We don't track the saved extension separately — it's encoded in
-  /// `photoUrl` but cheaper to just attempt every known one.
-  private async removeInstructorPhotoFiles(userId: string) {
-    await Promise.all(
-      Object.values(MIME_TO_EXT).map((ext) =>
-        fs
-          .unlink(join(INSTRUCTOR_PHOTOS_DIR, `${userId}.${ext}`))
-          .catch(() => undefined),
-      ),
-    );
   }
 
   /// ADMIN can edit anyone's photo; INSTRUCTOR can edit only their own.
@@ -594,6 +606,12 @@ export class UsersService {
     const { arenaAssignments, ...rest } = user;
     return {
       ...rest,
+      // CPF is encrypted at rest; surface the plaintext to the user who
+      // owns the record (this method backs `/users/me`). `tryDecryptCpf`
+      // is lenient — returns the raw value when it's still 11-digit
+      // plaintext (pre-migration rows), the decrypted CPF when it's a
+      // valid ciphertext, or null on corrupted/wrong-key.
+      cpf: tryDecryptCpf(rest.cpf),
       arenas: arenaAssignments.map((a) => a.unit),
     };
   }

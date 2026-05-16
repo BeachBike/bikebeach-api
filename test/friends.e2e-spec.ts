@@ -209,7 +209,10 @@ describe('Friends (e2e)', () => {
     const r = request(server)
       [method](path)
       .set('Authorization', `Bearer ${token}`);
-    if (body !== undefined) r.send(body);
+    // supertest's .send() is typed string|object; `unknown` narrows to
+    // `{} | null` which TS rejects. Callers only ever pass a JSON body
+    // or nothing, so asserting the send-boundary type is safe.
+    if (body !== undefined) r.send(body as string | object);
     const res = await r;
     if (res.status >= 400) {
       throw new Error(

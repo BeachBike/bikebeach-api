@@ -161,6 +161,35 @@ enum FitnessLevel {
   AVANCADO
 }
 
+/// 2026-05-15 — every transactional e-mail the system tries to send is
+/// recorded as an `EmailLog` row. Status starts at `QUEUED` and is updated
+/// to `SENT` / `FAILED` once the Resend call returns. `SKIPPED` covers the
+/// dev-mode stub (no API key configured).
+enum EmailTemplate {
+  WELCOME
+  RESERVATION_CONFIRMED
+  RESERVATION_REMINDER
+  WAITLIST_PROMOTED
+  CLASS_CANCELLED
+  PASSWORD_RESET
+  HEALTH_GATE_EXPIRING
+  PAYMENT_RECEIPT
+}
+
+enum EmailStatus {
+  QUEUED
+  SENT
+  FAILED
+  SKIPPED
+}
+
+/// Visual variant rendered for this send. Picked at random per dispatch
+/// (50/50). Tracked so we can A/B engagement if we ever want to.
+enum EmailVariant {
+  LIGHT
+  DARK
+}
+
 // =============================================================================
 // Tenancy
 // =============================================================================
@@ -209,7 +238,9 @@ model User {
   phone              String?
   /// Brazilian CPF — required by Asaas to create a customer. Captured at
   /// signup or via PATCH; can be null for staff who never purchase.
-  cpf                String?
+  /// `@unique` enforces no-duplicates at the DB layer (Postgres allows
+  /// multiple NULLs in unique columns, so unset CPFs don't collide).
+  cpf                String?       @unique
   /// Lazily set the first time the user makes a purchase. 1:1 with our User.
   asaasCustomerId    String?       @unique
   role               Role          @default(USER)
@@ -226,6 +257,13 @@ model User {
   /// (e.g. staff created by admin with a temporary password). Cleared on
   /// first successful password change.
   mustChangePassword Boolean       @default(false)
+  /// 2026-05-15 — set every time the password changes (signup, reset,
+  /// authenticated change). The JWT strategy refuses access tokens whose
+  /// `iat` is older than this timestamp — that's how a password reset
+  /// invalidates every outstanding access token system-wide. Refresh
+  /// tokens are revoked in the same transaction; this closes the same
+  /// window for the 15-min access tokens.
+  passwordChangedAt  DateTime      @default(now())
   /// 2026-05-14 — onboarding tour gate. False on signup; set to true the
   /// first time the user finishes or skips the dashboard tour. Drives the
   /// auto-open of the tour on the dashboard and the "rever tour" CTA in
@@ -267,6 +305,7 @@ model User {
   reservations          Reservation[]
   cancelledReservations Reservation[]         @relation("ReservationCancelledBy")
   waitlistEntries       WaitlistEntry[]
+  bikeHolds             BikeHold[]
   creditPacks           CreditPack[]
   /// 2026-05 — packs the user co-owns (was added as a friend by the
   /// buyer). The buyer's own packs are listed via `creditPacks` above.
@@ -289,6 +328,7 @@ model User {
   friendRequestsReceived FriendRequest[] @relation("FriendRequestTo")
   friendshipsAsA         Friendship[]    @relation("FriendshipA")
   friendshipsAsB         Friendship[]    @relation("FriendshipB")
+  emailLogs              EmailLog[]
 
   @@index([unitId])
 }
@@ -426,6 +466,7 @@ model Bike {
 
   reservations    Reservation[]
   maintenanceLogs BikeMaintenance[]
+  holds           BikeHold[]
 
   @@unique([unitId, label])
   @@unique([unitId, row, col], name: "Bike_unitId_row_col_key")
@@ -562,10 +603,42 @@ model ClassSlot {
 
   reservations    Reservation[]
   waitlistEntries WaitlistEntry[]
+  bikeHolds       BikeHold[]
 
   @@index([unitId, startsAt])
   @@index([instructorId, startsAt])
   @@index([status, startsAt])
+}
+
+/// Temporary exclusive claim on a (classSlot, bike) while a user is in the
+/// reservation flow (step 2 → step 3). NOT a reservation — no credit is
+/// consumed; it just blocks other users from picking the same seat during
+/// the selection/confirmation window so they don't waste time on step 3
+/// only to lose the atomic `Reservation.activeKey` race.
+///
+/// Concurrency: `@@unique([classSlotId, bikeId])` makes acquire atomic —
+/// the INSERT loser gets P2002 → 409, identical pattern to the reservation
+/// `activeKey`. `@@unique([classSlotId, userId])` caps a user at one held
+/// seat per slot (switching bikes = delete old + insert new in a tx).
+///
+/// Lifecycle: hard-deleted on release / confirm / expiry. `expiresAt` is
+/// `now + HOLD_TTL` (5 min). Reads filter `expiresAt > now` so a stale row
+/// never blocks; a per-minute cron deletes expired rows and broadcasts the
+/// seat-map change so the seat visually frees for others.
+model BikeHold {
+  id          String    @id @default(cuid())
+  classSlotId String
+  classSlot   ClassSlot @relation(fields: [classSlotId], references: [id], onDelete: Cascade)
+  bikeId      String
+  bike        Bike      @relation(fields: [bikeId], references: [id])
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt   DateTime
+  createdAt   DateTime  @default(now())
+
+  @@unique([classSlotId, bikeId])
+  @@unique([classSlotId, userId])
+  @@index([expiresAt])
 }
 
 /// A single (user, classSlot, bike) booking. Always sourced from a CreditPack.
@@ -889,4 +962,39 @@ model Friendship {
   @@unique([userAId, userBId])
   @@index([userAId])
   @@index([userBId])
+}
+
+// =============================================================================
+// Notifications — transactional e-mail (2026-05-15)
+// =============================================================================
+
+/// Audit log for every transactional e-mail dispatch. One row per attempt;
+/// retries (future) would add new rows. `userId` is optional because some
+/// flows (e.g. password reset by e-mail when user not yet looked up) can
+/// log a SKIPPED entry before a user is resolved — every other path fills
+/// it in. `externalId` holds the Resend message id when available.
+model EmailLog {
+  id           String        @id @default(cuid())
+  template     EmailTemplate
+  variant      EmailVariant
+  status       EmailStatus
+  toEmail      String
+  subject      String
+  userId       String?
+  user         User?         @relation(fields: [userId], references: [id])
+  /// JSON snapshot of the variables passed to the template. Helps debugging
+  /// "why does this e-mail say X instead of Y". Small (<2KB usually).
+  payload      Json
+  /// Resend message id (`emails.send` response). Null while QUEUED / for
+  /// SKIPPED rows.
+  externalId   String?
+  /// Last error string when status = FAILED. Null otherwise.
+  errorMessage String?
+  attemptCount Int           @default(1)
+  createdAt    DateTime      @default(now())
+  sentAt       DateTime?
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([template, createdAt(sort: Desc)])
+  @@index([status])
 }

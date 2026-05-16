@@ -5,26 +5,30 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { CreditDebtReason } from '@prisma/client';
+import { timingSafeEqual } from 'crypto';
 import type { AsaasWebhookPayload } from '../asaas/asaas-client.types';
 import { PaymentsService } from '../payments/payments.service';
 
 @Injectable()
 export class WebhooksService {
   private readonly logger = new Logger(WebhooksService.name);
-  private readonly expectedToken: string;
+  private readonly expectedTokenBuffer: Buffer;
 
   constructor(
     config: ConfigService,
     private readonly payments: PaymentsService,
   ) {
-    this.expectedToken = config.getOrThrow<string>('ASAAS_WEBHOOK_TOKEN');
+    this.expectedTokenBuffer = Buffer.from(
+      config.getOrThrow<string>('ASAAS_WEBHOOK_TOKEN'),
+      'utf8',
+    );
   }
 
   async handle(
     receivedToken: string | undefined,
     payload: AsaasWebhookPayload,
   ): Promise<void> {
-    if (!receivedToken || receivedToken !== this.expectedToken) {
+    if (!this.isTokenValid(receivedToken)) {
       // Constant-message error — don't leak whether the header was missing or wrong
       throw new UnauthorizedException('Invalid webhook authentication');
     }
@@ -82,5 +86,16 @@ export class WebhooksService {
       default:
         this.logger.log(`Ignored Asaas event: ${payload.event}`);
     }
+  }
+
+  /// Constant-time comparison so a remote attacker can't probe the secret
+  /// one byte at a time via response timing. `timingSafeEqual` requires
+  /// equal-length buffers — short-circuit length mismatch (and missing
+  /// header) before falling through.
+  private isTokenValid(received: string | undefined): boolean {
+    if (!received) return false;
+    const receivedBuffer = Buffer.from(received, 'utf8');
+    if (receivedBuffer.length !== this.expectedTokenBuffer.length) return false;
+    return timingSafeEqual(receivedBuffer, this.expectedTokenBuffer);
   }
 }

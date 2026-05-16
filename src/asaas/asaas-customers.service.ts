@@ -1,5 +1,6 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { User } from '@prisma/client';
+import { tryDecryptCpf } from '../common/cpf-crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { AsaasClientService } from './asaas-client.service';
 
@@ -20,7 +21,12 @@ export class AsaasCustomersService {
   async ensureCustomer(user: User): Promise<string> {
     if (user.asaasCustomerId) return user.asaasCustomerId;
 
-    if (!user.cpf) {
+    // CPF is encrypted at rest (AES-GCM, deterministic). Decrypt before
+    // calling Asaas — they need the raw 11-digit value. `tryDecryptCpf`
+    // also passes pre-migration plaintext rows through unchanged so the
+    // app keeps working across the transition.
+    const plaintextCpf = tryDecryptCpf(user.cpf);
+    if (!plaintextCpf) {
       throw new BadRequestException({
         code: 'CPF_REQUIRED',
         message: 'Informe seu CPF antes de comprar',
@@ -30,7 +36,7 @@ export class AsaasCustomersService {
     const customer = await this.asaas.createCustomer({
       name: user.name,
       email: user.email,
-      cpfCnpj: user.cpf,
+      cpfCnpj: plaintextCpf,
       mobilePhone: user.phone ?? undefined,
     });
 

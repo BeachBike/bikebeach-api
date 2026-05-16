@@ -28,6 +28,12 @@ export const REFUND_PACK_VALIDITY_DAYS = 30;
 /// TTL for password-reset tokens issued via /auth/forgot-password.
 export const PASSWORD_RESET_TOKEN_TTL_MINUTES = 30;
 
+/// How long a `BikeHold` keeps a seat exclusively claimed while the user
+/// is in the reservation flow (step 2 → step 3). Re-touched to a fresh
+/// window when the user advances to the confirmation step, so they always
+/// get a full window on step 3 regardless of how long they spent picking.
+export const BIKE_HOLD_TTL_MINUTES = 5;
+
 /// PIX discount applied to one-off pack purchases. Whole-percent value
 /// (5 = 5% off). 2026-05 — promoted from `Unit.pixDiscountPercent` to a
 /// system-wide constant since the studio decided every arena uses the

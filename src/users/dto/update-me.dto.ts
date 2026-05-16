@@ -5,6 +5,7 @@ import {
   IsString,
   Matches,
 } from 'class-validator';
+import { IsCpfValid } from '../../common/decorators/is-cpf-valid.decorator';
 
 /// Self-service update for the authenticated user. Name and password are
 /// intentionally NOT here — name change is a recepção-side operation
@@ -23,13 +24,15 @@ export class UpdateMeDto {
   @Matches(/^(\+?[0-9\s\-()]{8,20})?$/, { message: 'Telefone inválido' })
   phone?: string;
 
-  /// CPF — 11 raw digits or empty (clears). Mod-11 isn't enforced here;
-  /// Asaas will reject at first purchase if it's wrong.
+  /// CPF — 11 raw digits or empty (clears). Mod-11 IS enforced; uniqueness
+  /// is enforced at the DB (`@unique` on User.cpf) plus a friendly
+  /// pre-check in `updateMe`.
   @IsOptional()
   @IsString()
   @Matches(/^(\d{11})?$/, {
     message: 'CPF deve ter 11 dígitos numéricos (sem pontos/hífens)',
   })
+  @IsCpfValid()
   cpf?: string;
 
   @IsOptional()

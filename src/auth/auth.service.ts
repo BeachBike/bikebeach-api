@@ -6,10 +6,12 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
-import { Role } from '@prisma/client';
+import { Prisma, Role } from '@prisma/client';
 import { compare, hash } from 'bcrypt';
 import { createHash, randomBytes } from 'crypto';
 import { PASSWORD_RESET_TOKEN_TTL_MINUTES } from '../common/constants';
+import { encryptCpf } from '../common/cpf-crypto';
+import { MailerService } from '../mailer/mailer.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { ChangePasswordDto } from './dto/change-password.dto';
 import { ForgotPasswordDto } from './dto/forgot-password.dto';
@@ -21,6 +23,15 @@ import type { JwtPayload } from './types/jwt-payload.type';
 const BCRYPT_ROUNDS = 12;
 const REFRESH_TOKEN_BYTES = 48;
 const RESET_TOKEN_BYTES = 32;
+
+/// Pre-computed bcrypt hash of a string that's not a valid password (random
+/// bytes longer than the 72-char ceiling that the signup DTO accepts).
+/// `login` runs `bcrypt.compare` against this when the user lookup fails,
+/// so the response latency is the same whether the account exists or not —
+/// closes the timing channel that would otherwise let an attacker enumerate
+/// e-mails by measuring how fast `/auth/login` responds.
+const DUMMY_BCRYPT_HASH =
+  '$2b$12$abcdefghijklmnopqrstuOiQmoEzkA/4tzL35h5O.fX5UfMmgKDi6';
 
 export interface UserForToken {
   id: string;
@@ -52,6 +63,7 @@ export class AuthService {
     private readonly prisma: PrismaService,
     private readonly jwt: JwtService,
     private readonly config: ConfigService,
+    private readonly mailer: MailerService,
   ) {}
 
   async signup(
@@ -66,30 +78,81 @@ export class AuthService {
       throw new ConflictException('E-mail já cadastrado');
     }
 
+    // Encrypt CPF before any DB touch. The column stores the AES-GCM
+    // ciphertext (LGPD); the encryption is deterministic, so the existing
+    // `@unique` constraint still enforces no-duplicates. The pre-check
+    // lookup must use the SAME ciphertext the insert will write.
+    const encryptedCpf = dto.cpf ? encryptCpf(dto.cpf) : null;
+    if (encryptedCpf) {
+      const byCpf = await this.prisma.user.findFirst({
+        where: { cpf: encryptedCpf },
+        select: { id: true },
+      });
+      if (byCpf) {
+        throw new ConflictException('CPF já cadastrado');
+      }
+    }
+
     const passwordHash = await hash(dto.password, BCRYPT_ROUNDS);
     
-    // Parse birthDate as local date (not UTC) to avoid timezone shift.
-    // "YYYY-MM-DD" → Date object in local timezone.
+    // Parse "YYYY-MM-DD" as **UTC midnight** so the stored instant is the
+    // same wall-clock date in every viewer's timezone. Previously this used
+    // `new Date(y, m-1, d)` which anchors to the API process's local TZ —
+    // on Railway (UTC) the stored value rendered as the previous day in
+    // Brazilian browsers (off-by-one bug on birthDates).
     const birthDate = dto.birthDate
       ? (() => {
           const [year, month, day] = dto.birthDate.split('-');
-          return new Date(parseInt(year), parseInt(month) - 1, parseInt(day));
+          return new Date(
+            Date.UTC(parseInt(year), parseInt(month) - 1, parseInt(day)),
+          );
         })()
       : undefined;
 
-    const user = await this.prisma.user.create({
-      data: {
-        email: dto.email,
-        passwordHash,
-        name: dto.name,
-        phone: dto.phone,
-        cpf: dto.cpf,
-        birthDate,
-        goal: dto.goal,
-        fitnessLevel: dto.fitnessLevel,
-        role: Role.USER,
-      },
-    });
+    let user;
+    try {
+      user = await this.prisma.user.create({
+        data: {
+          email: dto.email,
+          passwordHash,
+          name: dto.name,
+          phone: dto.phone,
+          cpf: encryptedCpf,
+          birthDate,
+          goal: dto.goal,
+          fitnessLevel: dto.fitnessLevel,
+          role: Role.USER,
+        },
+      });
+    } catch (err) {
+      // Safety net for the race window between the pre-check above and the
+      // insert (two near-simultaneous signups with the same CPF).
+      if (
+        err instanceof Prisma.PrismaClientKnownRequestError &&
+        err.code === 'P2002'
+      ) {
+        const target = (err.meta?.target as string[] | undefined)?.[0];
+        if (target === 'cpf') throw new ConflictException('CPF já cadastrado');
+        if (target === 'email') throw new ConflictException('E-mail já cadastrado');
+        throw new ConflictException('Valor já em uso');
+      }
+      throw err;
+    }
+
+    void this.mailer
+      .send({
+        template: 'WELCOME',
+        to: user.email,
+        userId: user.id,
+        payload: {
+          name: user.name,
+          email: user.email,
+          appUrl: this.appUrl(),
+        },
+      })
+      .catch((err) =>
+        this.logger.warn(`welcome email skipped for ${user.email}: ${(err as Error).message}`),
+      );
 
     return this.issueTokenPair(user, ip, userAgent);
   }
@@ -102,12 +165,16 @@ export class AuthService {
     const user = await this.prisma.user.findUnique({
       where: { email: dto.email },
     });
-    if (!user || !user.isActive) {
-      throw new UnauthorizedException('Credenciais inválidas');
-    }
-
-    const ok = await compare(dto.password, user.passwordHash);
-    if (!ok) {
+    // Run bcrypt.compare unconditionally — when the user doesn't exist we
+    // compare against a fixed dummy hash so the response latency leaks
+    // nothing about which e-mails are registered. The result is ignored in
+    // the "no user" branch; the unified UnauthorizedException below covers
+    // both cases.
+    const ok = await compare(
+      dto.password,
+      user?.passwordHash ?? DUMMY_BCRYPT_HASH,
+    );
+    if (!user || !user.isActive || !ok) {
       throw new UnauthorizedException('Credenciais inválidas');
     }
 
@@ -180,7 +247,11 @@ export class AuthService {
   /// existence). When the user IS found, generates a single-use token, hashes
   /// it, persists with TTL. The raw token is what would be e-mailed to the
   /// user (Resend wiring deferred to Phase 6).
-  async forgotPassword(dto: ForgotPasswordDto): Promise<ForgotPasswordResult> {
+  async forgotPassword(
+    dto: ForgotPasswordDto,
+    ip?: string,
+    userAgent?: string,
+  ): Promise<ForgotPasswordResult> {
     const user = await this.prisma.user.findUnique({
       where: { email: dto.email },
     });
@@ -202,12 +273,33 @@ export class AuthService {
       `Password reset token issued for ${user.email} (TTL ${PASSWORD_RESET_TOKEN_TTL_MINUTES}m)`,
     );
 
-    // Resend integration lives in Phase 6 — for now we expose the token in
-    // non-production envs so frontend can wire the flow end-to-end.
+    void this.mailer
+      .send({
+        template: 'PASSWORD_RESET',
+        to: user.email,
+        userId: user.id,
+        payload: {
+          name: user.name,
+          resetUrl: `${this.appUrl()}/conta?reset=${encodeURIComponent(rawToken)}`,
+          expiresInMinutes: PASSWORD_RESET_TOKEN_TTL_MINUTES,
+          requestedFromIp: ip ?? null,
+          userAgent: userAgent ?? null,
+        },
+      })
+      .catch((err) =>
+        this.logger.warn(`password-reset email skipped for ${user.email}: ${(err as Error).message}`),
+      );
+
+    // In non-production we still expose the raw token in the response so the
+    // frontend / tests can wire the flow without parsing e-mails.
     const devToken =
       process.env.NODE_ENV !== 'production' ? rawToken : undefined;
 
     return { emailSent: true, devToken };
+  }
+
+  private appUrl(): string {
+    return (this.config.get<string>('APP_URL') ?? 'http://localhost:5173').replace(/\/$/, '');
   }
 
   /// Validates token + TTL + single-use, sets new password, marks token used,
@@ -230,7 +322,14 @@ export class AuthService {
     await this.prisma.$transaction([
       this.prisma.user.update({
         where: { id: stored.userId },
-        data: { passwordHash, mustChangePassword: false },
+        // `passwordChangedAt = now` invalidates every outstanding access
+        // token via the JWT strategy guard. Refresh tokens are revoked
+        // below; together this kills every session on every device.
+        data: {
+          passwordHash,
+          mustChangePassword: false,
+          passwordChangedAt: new Date(),
+        },
       }),
       this.prisma.passwordResetToken.update({
         where: { id: stored.id },
@@ -262,7 +361,11 @@ export class AuthService {
     await this.prisma.$transaction([
       this.prisma.user.update({
         where: { id: userId },
-        data: { passwordHash, mustChangePassword: false },
+        data: {
+          passwordHash,
+          mustChangePassword: false,
+          passwordChangedAt: new Date(),
+        },
       }),
       this.prisma.refreshToken.updateMany({
         where: { userId, revokedAt: null },

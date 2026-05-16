@@ -68,6 +68,48 @@ describe('Auth (e2e)', () => {
       .expect(409);
   });
 
+  it('POST /auth/signup with an invalid CPF (Mod-11 fails) returns 400', async () => {
+    // Format passes the digit-only regex; check digits do not.
+    await request(app.getHttpServer())
+      .post('/auth/signup')
+      .send({
+        email: `e2e-${randomUUID()}@test.local`,
+        password,
+        name: 'CPF inválido',
+        cpf: '12345678900',
+      })
+      .expect(400);
+  });
+
+  it('POST /auth/signup rejects all-same-digit CPFs (passes naive Mod-11)', async () => {
+    await request(app.getHttpServer())
+      .post('/auth/signup')
+      .send({
+        email: `e2e-${randomUUID()}@test.local`,
+        password,
+        name: 'CPF repetido',
+        cpf: '11111111111',
+      })
+      .expect(400);
+  });
+
+  it('POST /auth/signup with a duplicate CPF returns 409', async () => {
+    // Generated valid CPF: 39053344705 (real check digits, not in any
+    // existing test fixture). Sign up once successfully, then again with
+    // the same CPF on a different e-mail — second one must 409.
+    const validCpf = '39053344705';
+    const firstEmail = `e2e-${randomUUID()}@test.local`;
+    const secondEmail = `e2e-${randomUUID()}@test.local`;
+    await request(app.getHttpServer())
+      .post('/auth/signup')
+      .send({ email: firstEmail, password, name: 'CPF first', cpf: validCpf })
+      .expect(201);
+    await request(app.getHttpServer())
+      .post('/auth/signup')
+      .send({ email: secondEmail, password, name: 'CPF dup', cpf: validCpf })
+      .expect(409);
+  });
+
   it('POST /auth/login with the wrong password returns 401', async () => {
     await request(app.getHttpServer())
       .post('/auth/login')

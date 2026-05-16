@@ -11,11 +11,15 @@ import {
   Prisma,
   ReservationStatus,
 } from '@prisma/client';
+import { ConfigService } from '@nestjs/config';
+import { WAITLIST_PROTECTED_CANCELLATION_WINDOW_HOURS } from '../common/constants';
 import { assertNoOpenCreditDebt } from '../common/credit-debt.guard';
 import { assertCanManageSlot } from '../common/tenancy';
 import type { AuthenticatedUser } from '../common/types/authenticated-user.type';
 import { HealthGateService } from '../health-gate/health-gate.service';
+import { MailerService } from '../mailer/mailer.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { RealtimeService } from '../realtime/realtime.service';
 
 export interface PromotionResult {
   reservationId: string;
@@ -30,7 +34,51 @@ export class WaitlistService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly healthGate: HealthGateService,
+    private readonly mailer: MailerService,
+    private readonly config: ConfigService,
+    private readonly realtime: RealtimeService,
   ) {}
+
+  private appUrl(): string {
+    return (this.config.get<string>('APP_URL') ?? 'http://localhost:5173').replace(/\/$/, '');
+  }
+
+  /// Fires the WAITLIST_PROMOTED template using the reservation context.
+  /// Called by `tryPromoteAfterCancellation` once the promotion commits.
+  private async sendWaitlistPromotedEmail(reservationId: string): Promise<void> {
+    const reservation = await this.prisma.reservation.findUnique({
+      where: { id: reservationId },
+      include: {
+        user: { select: { id: true, name: true, email: true } },
+        bike: { select: { label: true } },
+        classSlot: {
+          include: {
+            classKind: { select: { name: true } },
+            instructor: { select: { name: true } },
+          },
+        },
+      },
+    });
+    if (!reservation || !reservation.user) return;
+    const startsAt = reservation.classSlot.startsAt;
+    const cancelDeadlineAt = new Date(
+      startsAt.getTime() - WAITLIST_PROTECTED_CANCELLATION_WINDOW_HOURS * 3_600_000,
+    );
+    await this.mailer.send({
+      template: 'WAITLIST_PROMOTED',
+      to: reservation.user.email,
+      userId: reservation.user.id,
+      payload: {
+        name: reservation.user.name,
+        classKind: reservation.classSlot.classKind?.name ?? reservation.classSlot.title ?? 'aula',
+        instructorName: reservation.classSlot.instructor?.name ?? 'instrutor',
+        startsAt: startsAt.toISOString(),
+        bikeLabel: reservation.bike.label,
+        reservationUrl: `${this.appUrl()}/dashboard`,
+        cancelDeadlineAt: cancelDeadlineAt.toISOString(),
+      },
+    });
+  }
 
   /// Joining the waitlist consumes 1 credit upfront (CLAUDE.md product
   /// rule, 2026-05). The credit goes back to the user's pack if:
@@ -429,6 +477,18 @@ export class WaitlistService {
           await tx.waitlistEntry.update({
             where: { id: next.id },
             data: { promotedAt: new Date() },
+          });
+          void this.sendWaitlistPromotedEmail(reservation.id).catch((err) =>
+            this.logger.warn(
+              `waitlist-promoted email skipped for ${reservation.id}: ${(err as Error).message}`,
+            ),
+          );
+          // Push to the promoted user's open sockets — UI updates without
+          // refresh. Payload is minimal; FE invalidates reservation/waitlist
+          // queries and refetches via REST.
+          this.realtime.notifyUser(next.userId, 'waitlist:promoted', {
+            slotId,
+            reservationId: reservation.id,
           });
           return {
             reservationId: reservation.id,
