@@ -571,6 +571,37 @@ export class ClassSlotsService {
       );
     }
 
+    // Trocar o professor só é permitido pra ADMIN. Instrutor que gerencia
+    // a própria aula pode editar tudo o mais, mas não passa pra outro.
+    // Mesma família de validação do create(): novo instrutor precisa estar
+    // ativo, ter role INSTRUCTOR e estar atribuído à arena da aula.
+    const changingInstructor =
+      dto.instructorId !== undefined && dto.instructorId !== slot.instructorId;
+    if (changingInstructor) {
+      if (user.role !== Role.ADMIN) {
+        throw new ForbiddenException(
+          'Só admin pode trocar o professor de uma aula',
+        );
+      }
+      const instructor = await this.prisma.user.findUnique({
+        where: { id: dto.instructorId },
+        include: {
+          arenaAssignments: {
+            where: { unitId: slot.unitId },
+            select: { unitId: true },
+          },
+        },
+      });
+      if (
+        !instructor ||
+        instructor.role !== Role.INSTRUCTOR ||
+        !instructor.isActive ||
+        instructor.arenaAssignments.length === 0
+      ) {
+        throw new BadRequestException('Instrutor inválido para essa arena');
+      }
+    }
+
     const startsAt = dto.startsAt ? new Date(dto.startsAt) : undefined;
     if (
       startsAt &&
@@ -604,6 +635,7 @@ export class ClassSlotsService {
     return this.prisma.classSlot.update({
       where: { id },
       data: {
+        instructorId: changingInstructor ? dto.instructorId : undefined,
         classKindId: dto.classKindId,
         title: dto.title,
         startsAt,

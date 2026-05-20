@@ -8,9 +8,14 @@ import {
   Min,
 } from 'class-validator';
 
-/// Cannot change `unitId` or `instructorId` from here. Cancel + recreate
-/// instead. `status` is owned by the cancel endpoint.
+/// `unitId` can't change (would invalidate bike assignments / reservations).
+/// `instructorId` CAN change — admin-only, validated against the slot's arena.
+/// `status` is owned by the cancel endpoint.
 export class UpdateClassSlotDto {
+  @IsOptional()
+  @IsString()
+  instructorId?: string;
+
   @IsOptional()
   @IsString()
   classKindId?: string;
