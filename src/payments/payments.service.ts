@@ -99,6 +99,18 @@ export class PaymentsService {
     return (this.config.get<string>('APP_URL') ?? 'http://localhost:5173').replace(/\/$/, '');
   }
 
+  /// Maps an Asaas INFRA failure (timeout / 5xx / network — `!isClientError`)
+  /// to a clean, retryable client error. Nothing was charged; the UI shows a
+  /// "provider is down, try again" message instead of a raw 500. Same shape
+  /// the card flow already throws so the frontend handles both identically.
+  private throwProviderUnavailable(): never {
+    throw new BadRequestException({
+      code: 'PAYMENT_PROVIDER_UNAVAILABLE',
+      message:
+        'Não conseguimos falar com o provedor de pagamento agora. Nada foi cobrado — tenta de novo em instantes.',
+    });
+  }
+
   /// Fires the PAYMENT_RECEIPT template for a Payment that just transitioned
   /// to PAID. Called from `applyPaymentConfirmation` AFTER the transaction
   /// commits — fire-and-forget so the webhook responds quickly. Skips
@@ -156,8 +168,17 @@ export class PaymentsService {
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user) throw new NotFoundException('Usuário não encontrado');
 
-    // ensureCustomer also throws 400 CPF_REQUIRED when missing.
-    const customerId = await this.customers.ensureCustomer(user);
+    // ensureCustomer also throws 400 CPF_REQUIRED when missing. An Asaas
+    // infra failure here (down/timeout) becomes a clean provider-unavailable.
+    let customerId: string;
+    try {
+      customerId = await this.customers.ensureCustomer(user);
+    } catch (err) {
+      if (err instanceof AsaasApiError && !err.isClientError) {
+        this.throwProviderUnavailable();
+      }
+      throw err;
+    }
 
     // Discount campaign on the pack offer (C3) compounds with the PIX
     // off (item-14): apply the campaign first, then the PIX 5% on the
@@ -192,11 +213,17 @@ export class PaymentsService {
     dueDate.setDate(dueDate.getDate() + 1);
     const dueDateStr = dueDate.toISOString().slice(0, 10); // YYYY-MM-DD
 
+    // Pre-generate the local Payment id and thread it as `externalReference`
+    // so a create that TIMES OUT (charge made at Asaas, response lost) can be
+    // recovered by reference instead of the user retrying into a DUPLICATE
+    // charge — the same protection the card flow already has.
+    const paymentId = randomUUID();
     const paymentPayload = {
       customer: customerId,
       billingType: 'PIX' as const,
       value: amountCents / 100,
       dueDate: dueDateStr,
+      externalReference: paymentId,
       description:
         pixDiscountPercent > 0
           ? `Pacote ${offer.classes} aula${offer.classes > 1 ? 's' : ''} (PIX -${pixDiscountPercent}%)`
@@ -209,8 +236,31 @@ export class PaymentsService {
       dueDate: dueDateStr,
     });
 
-    const charge = await this.asaas.createPayment(paymentPayload);
-    
+    let charge: AsaasPayment;
+    try {
+      charge = await this.asaas.createPayment(paymentPayload);
+    } catch (err) {
+      // Transient/timeout failure (not a 4xx rejection): the charge MAY have
+      // gone through despite the lost response. Recover it by reference so we
+      // adopt the existing charge instead of ever creating a second one.
+      if (err instanceof AsaasApiError && !err.isClientError) {
+        const existing = await this.asaas
+          .getPaymentByExternalReference(paymentId)
+          .catch(() => null); // Asaas still down → treat as "not found"
+        if (existing) {
+          this.logger.warn(
+            `PIX create errored but charge exists (externalReference=${paymentId}) — adopting ${existing.id}`,
+          );
+          charge = existing;
+        } else {
+          // Genuine provider outage, nothing was charged → clean retryable error.
+          this.throwProviderUnavailable();
+        }
+      } else {
+        throw err;
+      }
+    }
+
     this.logger.debug('Asaas payment created:', {
       id: charge.id,
       billingType: charge.billingType,
@@ -225,6 +275,7 @@ export class PaymentsService {
 
     const payment = await this.prisma.payment.create({
       data: {
+        id: paymentId,
         userId: user.id,
         asaasChargeId: charge.id,
         amountCents,
@@ -636,6 +687,21 @@ export class PaymentsService {
       });
       if (claimed.count === 0) return;
 
+      // Cross-check the amount Asaas says was paid against what we charged.
+      // Asaas only fires PAYMENT_CONFIRMED/RECEIVED on a FULLY-paid charge,
+      // so a mismatch here means a tampered event, a bug, or an odd
+      // installment/rounding case — a tripwire worth a CRITICAL log. We do
+      // NOT block the mint: blocking would risk denying a legit customer
+      // (false positive), and the risk of a real underpayment slipping the
+      // token-authenticated webhook is low. To tighten later, gate the mint
+      // below on `paidCents >= localRow.amountCents - TOLERANCE`.
+      const paidCents = Math.round((asaasPayment.value ?? 0) * 100);
+      if (Math.abs(paidCents - localRow.amountCents) > 1) {
+        this.logger.error(
+          `PAYMENT AMOUNT MISMATCH paymentId=${localRow.id} asaasChargeId=${asaasPayment.id} expectedCents=${localRow.amountCents} paidCents=${paidCents}`,
+        );
+      }
+
       if (
         localRow.kind === PaymentKind.ONE_OFF_PACK &&
         localRow.packCredits !== null &&
@@ -993,7 +1059,12 @@ export class PaymentsService {
   /// appropriate. Safety net for: closed-tab PIX confirmations, expired
   /// QRs, card payments held for risk analysis that resolve later, and
   /// card rows whose Asaas charge id never made it back to us.
-  async reconcilePendingPayments(): Promise<{
+  /// Sweeps PENDING/IN_REVIEW payments and reconciles each against Asaas.
+  /// `opts.since` narrows to charges created at/after that instant — the fast
+  /// cron uses it to check only *recent* pending charges every 30s (a tiny
+  /// set), so a missed/delayed webhook still confirms in ~30s without
+  /// re-hitting Asaas for every old pending row. No `since` = full sweep.
+  async reconcilePendingPayments(opts?: { since?: Date }): Promise<{
     checked: number;
     paid: number;
     expired: number;
@@ -1002,6 +1073,7 @@ export class PaymentsService {
     const pending = await this.prisma.payment.findMany({
       where: {
         status: { in: [PaymentStatus.PENDING, PaymentStatus.IN_REVIEW] },
+        ...(opts?.since ? { createdAt: { gte: opts.since } } : {}),
       },
       select: { id: true, asaasChargeId: true },
     });

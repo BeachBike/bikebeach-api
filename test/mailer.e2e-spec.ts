@@ -70,7 +70,7 @@ describe('Mailer (e2e)', () => {
     const email = `e2e-mailer-welcome-${randomUUID()}@test.local`;
     await request(app.getHttpServer())
       .post('/auth/signup')
-      .send({ email, password: 'this-is-strong-enough', name: 'Helena Brandão' })
+      .send({ email, password: 'mailer-strong-2026', name: 'Helena Brandão' })
       .expect(201);
     const log = await waitForLog(prisma, { template: 'WELCOME', toEmail: email });
     expect(log.status).toBe(EmailStatus.SKIPPED); // no RESEND_API_KEY in tests
@@ -81,7 +81,7 @@ describe('Mailer (e2e)', () => {
     const email = `e2e-mailer-reset-${randomUUID()}@test.local`;
     await request(app.getHttpServer())
       .post('/auth/signup')
-      .send({ email, password: 'this-is-strong-enough', name: 'Marina Costa' })
+      .send({ email, password: 'mailer-strong-2026', name: 'Marina Costa' })
       .expect(201);
     await request(app.getHttpServer())
       .post('/auth/forgot-password')
@@ -95,7 +95,7 @@ describe('Mailer (e2e)', () => {
     const email = `e2e-mailer-redact-${randomUUID()}@test.local`;
     await request(app.getHttpServer())
       .post('/auth/signup')
-      .send({ email, password: 'this-is-strong-enough', name: 'Helena' })
+      .send({ email, password: 'mailer-strong-2026', name: 'Helena' })
       .expect(201);
     const res = await request(app.getHttpServer())
       .post('/auth/forgot-password')

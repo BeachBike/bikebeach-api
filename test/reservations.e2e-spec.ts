@@ -342,6 +342,69 @@ describe('Reservations (e2e)', () => {
     });
   });
 
+  // 2026-07 — a PAR-Q with any "SIM" (active health concern) must surface to
+  // the class's instructor/admin (in-app), without blocking the reservation.
+  describe('Health roster — flagged PAR-Q surfaces to manager', () => {
+    it('User1 submits a flagged PAR-Q (any SIM) → status.parq.flagged true', async () => {
+      await request(server)
+        .post('/parq/submit')
+        .set('Authorization', `Bearer ${user1Token}`)
+        .send({
+          version: 'v1.0',
+          answers: {
+            responses: { cardiac: 'sim', chestPainExercise: 'nao' },
+            notes: 'histórico cardíaco na família',
+          },
+        })
+        .expect(201);
+      const status = await api('get', '/health-gate/status', user1Token);
+      expect(status.parq.flagged).toBe(true);
+      expect(status.parq.flaggedKeys).toContain('cardiac');
+      // Flagged is NOT blocked — the gate stays valid time-wise.
+      expect(status.parq.valid).toBe(true);
+    });
+
+    it('roster marks the flagged participant (instructor view)', async () => {
+      const roster = await api(
+        'get',
+        `/class-slots/${slotFarId}/roster`,
+        instructorToken,
+      );
+      const row = roster.students.find(
+        (s: { user: { id: string } }) => s.user.id === user1Id,
+      );
+      expect(row).toBeDefined();
+      expect(row.healthFlagged).toBe(true);
+    });
+
+    it('participant-health endpoint returns the full PAR-Q (instructor)', async () => {
+      const health = await api(
+        'get',
+        `/class-slots/${slotFarId}/participants/${user1Id}/health`,
+        instructorToken,
+      );
+      expect(health.parq.flagged).toBe(true);
+      expect(health.parq.answers).not.toBeNull();
+      expect(health.parq.notes).toContain('cardíaco');
+    });
+
+    it('participant-health is forbidden for a regular USER', async () => {
+      await request(server)
+        .get(`/class-slots/${slotFarId}/participants/${user1Id}/health`)
+        .set('Authorization', `Bearer ${user2Token}`)
+        .expect(403);
+    });
+
+    it('participant-health 404s for a user not in the slot', async () => {
+      await request(server)
+        .get(
+          `/class-slots/${slotFarId}/participants/00000000-0000-0000-0000-000000000000/health`,
+        )
+        .set('Authorization', `Bearer ${instructorToken}`)
+        .expect(404);
+    });
+  });
+
   describe('Cancellation rules', () => {
     let nearReservationId: string;
     let farReservationId: string;

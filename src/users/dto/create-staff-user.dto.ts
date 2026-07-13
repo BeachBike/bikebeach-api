@@ -9,6 +9,7 @@ import {
   MaxLength,
   MinLength,
 } from 'class-validator';
+import { IsStrongPassword } from '../../common/decorators/is-strong-password.decorator';
 
 const STAFF_ROLES = [Role.INSTRUCTOR, Role.ADMIN] as const;
 type StaffRole = (typeof STAFF_ROLES)[number];
@@ -18,8 +19,7 @@ export class CreateStaffUserDto {
   email!: string;
 
   @IsString()
-  @MinLength(10, { message: 'Senha precisa ter no mínimo 10 caracteres' })
-  @MaxLength(72)
+  @IsStrongPassword()
   password!: string;
 
   @IsString()

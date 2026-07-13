@@ -733,6 +733,11 @@ model CreditPack {
   /// NULL means never expires (rare — admin grants only, typically).
   expiresAt        DateTime?
 
+  /// 2026-07 — free-text label for admin gifts (source=ADMIN_GRANT), e.g. the
+  /// campaign a giveaway pack came from ("sorteio insta jan"). NULL for every
+  /// non-gift pack. Surfaced in the admin "presentes" history + finance.
+  note             String?
+
   /// If sourced from a Subscription cycle, link back for traceability.
   subscriptionId String?
   subscription   Subscription? @relation(fields: [subscriptionId], references: [id])

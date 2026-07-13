@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { BikeHoldsModule } from '../bike-holds/bike-holds.module';
 import { FriendsModule } from '../friends/friends.module';
+import { HealthGateModule } from '../health-gate/health-gate.module';
 import { ReservationsModule } from '../reservations/reservations.module';
 import { WaitlistModule } from '../waitlist/waitlist.module';
 import { ClassSlotsController } from './class-slots.controller';
@@ -12,6 +13,7 @@ import { ClassSlotsService } from './class-slots.service';
     WaitlistModule,
     FriendsModule,
     BikeHoldsModule,
+    HealthGateModule,
   ],
   controllers: [ClassSlotsController],
   providers: [ClassSlotsService],

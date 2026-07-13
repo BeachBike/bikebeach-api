@@ -52,6 +52,14 @@ export class UsersController {
     await this.users.markOnboardingSeen(user.id);
   }
 
+  /// Admin live-search of regular users (role=USER) by name or email — powers
+  /// the "presentes" recipient picker. Returns a small capped list.
+  @Roles(Role.ADMIN)
+  @Get('search')
+  search(@Query('q') q?: string) {
+    return this.users.searchUsers(q ?? '');
+  }
+
   @Roles(Role.ADMIN)
   @Get('staff')
   listStaff(

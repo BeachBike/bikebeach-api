@@ -16,10 +16,12 @@ import {
   Role,
   StudioCancellationReason,
 } from '@prisma/client';
+import { isParqFlagged } from '../common/parq-questions';
 import { assertCanAccessUnit, assertCanManageSlot } from '../common/tenancy';
 import type { AuthenticatedUser } from '../common/types/authenticated-user.type';
 import { BikeHoldsService } from '../bike-holds/bike-holds.service';
 import { FriendsService } from '../friends/friends.service';
+import { HealthGateService } from '../health-gate/health-gate.service';
 import { MailerService } from '../mailer/mailer.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { RealtimeService } from '../realtime/realtime.service';
@@ -83,6 +85,7 @@ export class ClassSlotsService {
     private readonly config: ConfigService,
     private readonly realtime: RealtimeService,
     private readonly holds: BikeHoldsService,
+    private readonly healthGate: HealthGateService,
   ) {}
 
   private appUrl(): string {
@@ -528,6 +531,21 @@ export class ClassSlotsService {
       presencaCounts.map((p) => [p.userId, p._count._all]),
     );
 
+    // Latest PAR-Q per participant → `healthFlagged` badge for the
+    // instructor/admin. One query for the whole roster; we keep only the
+    // newest response per user.
+    const parqResponses = await this.prisma.parqResponse.findMany({
+      where: { userId: { in: userIds } },
+      orderBy: { acceptedAt: 'desc' },
+      select: { userId: true, answers: true },
+    });
+    const flaggedByUser = new Map<string, boolean>();
+    for (const p of parqResponses) {
+      if (!flaggedByUser.has(p.userId)) {
+        flaggedByUser.set(p.userId, isParqFlagged(p.answers));
+      }
+    }
+
     const waitlist = await this.prisma.waitlistEntry.count({
       where: { classSlotId: id, removedAt: null, promotedAt: null },
     });
@@ -550,6 +568,9 @@ export class ClassSlotsService {
           user: r.user,
           bikeLabel: r.bike.label,
           presencaCount,
+          /// PAR-Q com algum "SIM" — sinaliza atenção de saúde pro professor
+          /// e admin. O detalhe fica atrás do endpoint participants/:id/health.
+          healthFlagged: flaggedByUser.get(r.userId) ?? false,
           // "first class ever" = this is their first attendance (presencaCount === 0
           // and they're still ACTIVE) OR (presencaCount === 1 and they just CHECKED_IN/COMPLETED here).
           isFirstClass:
@@ -559,6 +580,28 @@ export class ClassSlotsService {
         };
       }),
     };
+  }
+
+  /// Full PAR-Q + liability of one participant, for the class's instructor or
+  /// an admin to review (LGPD-sensitive — only managers of THIS slot, and
+  /// only for a user who actually holds a reservation in it).
+  async participantHealth(slotId: string, userId: string, user: AuthenticatedUser) {
+    const slot = await this.findOne(slotId);
+    assertCanManageSlot(user, slot);
+
+    const reservation = await this.prisma.reservation.findFirst({
+      where: {
+        classSlotId: slotId,
+        userId,
+        status: { in: ['ACTIVE', 'CHECKED_IN', 'COMPLETED', 'NO_SHOW'] },
+      },
+      select: { id: true },
+    });
+    if (!reservation) {
+      throw new NotFoundException('Participante não está nesta aula');
+    }
+
+    return this.healthGate.getUserHealthForManager(userId);
   }
 
   async update(id: string, dto: UpdateClassSlotDto, user: AuthenticatedUser) {

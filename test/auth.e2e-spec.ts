@@ -110,6 +110,39 @@ describe('Auth (e2e)', () => {
       .expect(409);
   });
 
+  it('POST /auth/signup rejects a low-complexity password (needs 3 char classes)', async () => {
+    // 12 chars but a single class (lowercase only) — fails the 3-of-4 rule.
+    await request(app.getHttpServer())
+      .post('/auth/signup')
+      .send({
+        email: `e2e-${randomUUID()}@test.local`,
+        password: 'senhafraquin',
+        name: 'Senha fraca',
+      })
+      .expect(400);
+  });
+
+  it('POST /auth/signup rejects a common password even when it mixes classes', async () => {
+    // "Password1!" has all 4 classes but is on the common-password blocklist.
+    await request(app.getHttpServer())
+      .post('/auth/signup')
+      .send({
+        email: `e2e-${randomUUID()}@test.local`,
+        password: 'Password1!',
+        name: 'Comum',
+      })
+      .expect(400);
+  });
+
+  it('POST /auth/signup rejects a password equal to the user e-mail', async () => {
+    const idEmail = `e2e-${randomUUID()}@test.local`;
+    const local = idEmail.split('@')[0]; // long, mixes classes, only fails identity
+    await request(app.getHttpServer())
+      .post('/auth/signup')
+      .send({ email: idEmail, password: local, name: 'Identidade' })
+      .expect(400);
+  });
+
   it('POST /auth/login with the wrong password returns 401', async () => {
     await request(app.getHttpServer())
       .post('/auth/login')

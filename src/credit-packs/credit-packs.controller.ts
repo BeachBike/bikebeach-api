@@ -28,6 +28,13 @@ export class CreditPacksController {
     return this.packs.grant(dto);
   }
 
+  /// Recent admin gifts (source=ADMIN_GRANT) — the "presentes" history.
+  @Roles(Role.ADMIN)
+  @Get('grants')
+  listGrants(@Query('limit') limit?: string) {
+    return this.packs.listGrants(limit ? parseInt(limit, 10) : undefined);
+  }
+
   @Get('me')
   listMine(
     @CurrentUser() user: AuthenticatedUser,

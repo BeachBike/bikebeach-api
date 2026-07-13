@@ -112,6 +112,11 @@ describe('Admin CRUD (e2e)', () => {
     await prisma.plan.deleteMany({
       where: { name: { startsWith: 'e2e-' } },
     });
+    // Gifted packs (admin grant) reference the e2e user — drop them before the
+    // user so the FK doesn't block deletion.
+    await prisma.creditPack.deleteMany({
+      where: { user: { email: { startsWith: 'e2e-' } } },
+    });
     await prisma.user.deleteMany({
       where: { email: { startsWith: 'e2e-' } },
     });
@@ -523,6 +528,86 @@ describe('Admin CRUD (e2e)', () => {
         .set('Authorization', `Bearer ${userToken}`)
         .send({ name: 'e2e-x', monthlyCredits: 1, priceCents: 100 })
         .expect(403);
+    });
+  });
+
+  // 2026-07 — admin gifts (cortesias / sorteios): grant free credits, search
+  // recipients, list gifts. Reuses POST /credit-packs/grant (ADMIN_GRANT).
+  describe('Presentes (admin gifts)', () => {
+    let userId: string;
+
+    it('resolves the target user id', async () => {
+      const me = await request(server)
+        .get('/users/me')
+        .set('Authorization', `Bearer ${userToken}`)
+        .expect(200);
+      userId = me.body.id;
+      expect(userId).toEqual(expect.any(String));
+    });
+
+    it('admin search finds a regular user by email substring', async () => {
+      const local = userEmail.split('@')[0]; // e2e-user-<uuid>
+      const res = await request(server)
+        .get('/users/search')
+        .query({ q: local })
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200);
+      expect(res.body.some((u: { id: string }) => u.id === userId)).toBe(true);
+    });
+
+    it('user search is forbidden for a regular USER (403)', async () => {
+      await request(server)
+        .get('/users/search')
+        .query({ q: 'e2e' })
+        .set('Authorization', `Bearer ${userToken}`)
+        .expect(403);
+    });
+
+    it('admin grants a free pack with a campaign note', async () => {
+      const res = await request(server)
+        .post('/credit-packs/grant')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ userId, credits: 10, note: 'sorteio insta e2e' })
+        .expect(201);
+      expect(res.body).toMatchObject({
+        userId,
+        source: 'ADMIN_GRANT',
+        totalCredits: 10,
+        remainingCredits: 10,
+        note: 'sorteio insta e2e',
+      });
+    });
+
+    it('non-admin cannot grant (403)', async () => {
+      await request(server)
+        .post('/credit-packs/grant')
+        .set('Authorization', `Bearer ${userToken}`)
+        .send({ userId, credits: 1 })
+        .expect(403);
+    });
+
+    it('the gifted pack shows in the user wallet as a cortesia', async () => {
+      const packs = await request(server)
+        .get('/credit-packs/me')
+        .set('Authorization', `Bearer ${userToken}`)
+        .expect(200);
+      const gift = packs.body.find(
+        (p: { source: string; totalCredits: number }) =>
+          p.source === 'ADMIN_GRANT' && p.totalCredits === 10,
+      );
+      expect(gift).toBeDefined();
+    });
+
+    it('admin grants list includes the gift with its note', async () => {
+      const res = await request(server)
+        .get('/credit-packs/grants')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(200);
+      const found = res.body.find(
+        (g: { user: { id: string }; note: string | null }) =>
+          g.user.id === userId && g.note === 'sorteio insta e2e',
+      );
+      expect(found).toBeDefined();
     });
   });
 });

@@ -29,6 +29,26 @@ export class CreditPacksService {
         totalCredits: dto.credits,
         remainingCredits: dto.credits,
         expiresAt: dto.expiresAt ? new Date(dto.expiresAt) : null,
+        note: dto.note?.trim() || null,
+      },
+    });
+  }
+
+  /// Recent admin gifts (source=ADMIN_GRANT), newest first — powers the
+  /// "presentes" history in the admin. Global (packs aren't unit-scoped).
+  async listGrants(limit = 50) {
+    return this.prisma.creditPack.findMany({
+      where: { source: CreditSource.ADMIN_GRANT },
+      orderBy: { createdAt: 'desc' },
+      take: Math.min(Math.max(limit, 1), 200),
+      select: {
+        id: true,
+        totalCredits: true,
+        remainingCredits: true,
+        note: true,
+        expiresAt: true,
+        createdAt: true,
+        user: { select: { id: true, name: true, email: true } },
       },
     });
   }

@@ -7,6 +7,7 @@ import {
   MaxLength,
   MinLength,
 } from 'class-validator';
+import { IsStrongPassword } from '../../common/decorators/is-strong-password.decorator';
 
 /// Patch payload for `/users/staff/:id`. Every field is optional —
 /// admin patches whichever subset they want to change.
@@ -22,8 +23,7 @@ export class UpdateStaffUserDto {
   /// on next login (mustChangePassword auto-set when this field is sent).
   @IsOptional()
   @IsString()
-  @MinLength(10)
-  @MaxLength(72)
+  @IsStrongPassword()
   password?: string;
 
   @IsOptional()

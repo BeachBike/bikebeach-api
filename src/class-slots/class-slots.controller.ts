@@ -128,6 +128,18 @@ export class ClassSlotsController {
     return this.slots.roster(id, user);
   }
 
+  /// Full PAR-Q + liability of one participant. Authorized to the class's
+  /// instructor or an admin (LGPD-sensitive; enforced in the service).
+  @Roles(Role.ADMIN, Role.INSTRUCTOR)
+  @Get(':id/participants/:userId/health')
+  participantHealth(
+    @Param('id') id: string,
+    @Param('userId') userId: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ) {
+    return this.slots.participantHealth(id, userId, user);
+  }
+
   @Roles(Role.ADMIN, Role.INSTRUCTOR)
   @Patch(':id')
   update(

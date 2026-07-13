@@ -229,6 +229,27 @@ export class UsersService {
     return flattenSpecialties(created);
   }
 
+  /// Admin live-search of regular users by name OR email (case-insensitive,
+  /// substring). Returns up to 10, active first then alphabetical. A blank
+  /// query returns nothing (the picker only searches once the admin types).
+  async searchUsers(rawQuery: string) {
+    const q = rawQuery.trim();
+    if (q.length < 1) return [];
+    const users = await this.prisma.user.findMany({
+      where: {
+        role: Role.USER,
+        OR: [
+          { name: { contains: q, mode: 'insensitive' } },
+          { email: { contains: q, mode: 'insensitive' } },
+        ],
+      },
+      orderBy: [{ isActive: 'desc' }, { name: 'asc' }],
+      take: 10,
+      select: { id: true, name: true, email: true, isActive: true },
+    });
+    return users;
+  }
+
   async listStaff(filter: { role?: Role; unitId?: string }) {
     const where: Prisma.UserWhereInput = {
       role: filter.role ? filter.role : { in: [Role.INSTRUCTOR, Role.ADMIN] },

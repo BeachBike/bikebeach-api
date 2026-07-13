@@ -20,17 +20,33 @@ export class PaymentReconciliationService {
 
   constructor(private readonly payments: PaymentsService) {}
 
+  /// Full sweep every 5 min — catches the long tail (QR expiring, older
+  /// stragglers). The fast pass below handles fresh charges.
   @Cron(CronExpression.EVERY_5_MINUTES, { name: 'payment-reconcile' })
   async tick() {
+    await this.run();
+  }
+
+  /// Fast pass every 30s, scoped to charges created in the last 6 minutes.
+  /// This is the near-real-time fallback: if the Asaas webhook is missed or
+  /// delayed, a fresh payment still confirms within ~30s instead of up to 5
+  /// minutes — critical for the user staring at the checkout screen. The
+  /// window keeps the queried set tiny (usually 0), so it's cheap on Asaas.
+  @Cron('*/30 * * * * *', { name: 'payment-reconcile-fast' })
+  async tickFast() {
+    await this.run({ since: new Date(Date.now() - 6 * 60_000) });
+  }
+
+  private async run(opts?: { since?: Date }) {
     if (process.env.NODE_ENV === 'test') return;
     if (process.env.JOBS_DISABLED === 'true') return;
 
     try {
       const { checked, paid, expired, failed } =
-        await this.payments.reconcilePendingPayments();
+        await this.payments.reconcilePendingPayments(opts);
       if (paid > 0 || expired > 0 || failed > 0) {
         this.logger.log(
-          `Payment reconcile: ${checked} checked → ${paid} paid, ${expired} expired, ${failed} failed`,
+          `Payment reconcile${opts?.since ? ' (fast)' : ''}: ${checked} checked → ${paid} paid, ${expired} expired, ${failed} failed`,
         );
       }
     } catch (err) {

@@ -82,6 +82,10 @@ export interface AdminFinanceReportDto {
   /// Revenue split by the originating CreditPack source. Useful to see
   /// "quanto veio de avulsa vs mensalista" without joining payments again.
   revenueBySource: { source: CreditSource; revenueCents: number }[];
+  /// 2026-07 — admin gifts (source=ADMIN_GRANT) created in the window. These
+  /// realize ZERO revenue by design; surfaced separately so the admin sees
+  /// how much was given away for free (sorteios / cortesias). Global.
+  gifts: { packCount: number; creditCount: number };
   /// Pack sales in the window — only PAID one-off packs. Sorted by soldCount
   /// desc. The label is `<n> aulas` so an admin can read it without joining
   /// PackOffer.
@@ -666,6 +670,22 @@ export class AdminService {
         }
       : null;
 
+    // ─── Admin gifts (cortesias) created in the window ──────────────────
+    // Free by design → zero revenue; reported as a separate "grátis" metric.
+    // Global (packs aren't unit-scoped, like pack sales above).
+    const giftAgg = await this.prisma.creditPack.aggregate({
+      where: {
+        source: CreditSource.ADMIN_GRANT,
+        createdAt: { gte: from, lt: to },
+      },
+      _count: { _all: true },
+      _sum: { totalCredits: true },
+    });
+    const gifts = {
+      packCount: giftAgg._count._all,
+      creditCount: giftAgg._sum.totalCredits ?? 0,
+    };
+
     return {
       period: { from: from.toISOString(), to: to.toISOString() },
       unitId: unitId ?? null,
@@ -679,6 +699,7 @@ export class AdminService {
       revenueBySource: [...sourceTotals.entries()]
         .map(([source, revenueCents]) => ({ source, revenueCents }))
         .sort((a, b) => b.revenueCents - a.revenueCents),
+      gifts,
       topPacks,
       revenueByMethod: [...methodMap.entries()]
         .map(([method, v]) => ({ method, ...v }))

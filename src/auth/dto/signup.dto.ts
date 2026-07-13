@@ -10,14 +10,14 @@ import {
   MinLength,
 } from 'class-validator';
 import { IsCpfValid } from '../../common/decorators/is-cpf-valid.decorator';
+import { IsStrongPassword } from '../../common/decorators/is-strong-password.decorator';
 
 export class SignupDto {
   @IsEmail()
   email!: string;
 
   @IsString()
-  @MinLength(10, { message: 'Senha precisa ter no mínimo 10 caracteres' })
-  @MaxLength(72, { message: 'Senha não pode passar de 72 caracteres' })
+  @IsStrongPassword()
   password!: string;
 
   @IsString()
